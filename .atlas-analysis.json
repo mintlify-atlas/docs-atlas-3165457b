@@ -1,0 +1,78 @@
+{
+  "projectType": "ai-ml",
+  "projectName": "Autorma",
+  "projectDescription": "An end-to-end MLOps system that automatically classifies returned e-commerce items into five categories using a fine-tuned EfficientNet-B0 model with 96.53% accuracy, served via a containerised FastAPI inference API with batch orchestration, MLflow model versioning, and Prometheus/Grafana monitoring.",
+  "theme": "sequoia",
+  "primaryColor": "#ef7025",
+  "lightColor": "#eec9bc",
+  "darkColor": "#4fa1ab",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": ["introduction", "quickstart"]
+          },
+          {
+            "group": "Concepts",
+            "pages": ["concepts/architecture", "concepts/model", "concepts/mlops"]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/setup",
+              "guides/model-registration",
+              "guides/batch-inference",
+              "guides/monitoring",
+              "guides/streamlit-ui",
+              "guides/model-management"
+            ]
+          },
+          {
+            "group": "Reference",
+            "pages": [
+              "reference/configuration",
+              "reference/metrics",
+              "reference/troubleshooting"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Model Service API",
+            "pages": [
+              "api/overview",
+              "api/health",
+              "api/predict",
+              "api/metrics"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "EfficientNet-B0 image classification with 96.53% test accuracy across 5 return categories",
+    "FastAPI inference service with Prometheus metrics and health checks",
+    "Idempotent batch orchestrator with checkpoint-based crash recovery",
+    "MLflow model registry with alias-based promotion and zero-downtime rollback",
+    "Prometheus + Grafana monitoring stack for request rates, latency, and class distribution",
+    "Streamlit UI for manual image upload, classification, and results history",
+    "Docker Compose deployment with artifact proxy via --serve-artifacts",
+    "Cron-schedulable nightly batch pipeline"
+  ],
+  "publicApiSurface": [
+    "POST /predict — batch image classification endpoint",
+    "GET /health — model service liveness and version check",
+    "GET /metrics — Prometheus scrape endpoint",
+    "BatchOrchestrator.run() — main batch inference entry point",
+    "RefundClassifier.predict() — MLflow pyfunc model prediction interface",
+    "scripts/register_model.py — model registration script",
+    "scripts/set_production.py — production alias promotion script"
+  ]
+}
