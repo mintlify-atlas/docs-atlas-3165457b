@@ -11,8 +11,8 @@ The model service reads configuration from environment variables (or an `.env` f
 
 | Variable | Type | Default | Required | Description |
 |---|---|---|---|---|
-| `MLFLOW_TRACKING_URI` | `str` | — | Yes | URI of the MLflow tracking server. At runtime in Docker, set to `http://mlflow:5000`. On the host for registration scripts, use `http://localhost:5000`. |
-| `MODEL_SERVICE_URL` | `str` | — | Yes | URL of this service itself. Used when the orchestrator and model service share a config source. Typically `http://localhost:8000` locally or `http://model-service:8000` inside Docker. |
+| `MLFLOW_TRACKING_URI` | `str` | — | Yes | URI of the MLflow tracking server. Set by Docker Compose to `http://mlflow:5000` so the service downloads model artifacts over HTTP through the MLflow proxy. |
+| `MODEL_SERVICE_URL` | `str` | — | Yes | Base URL of this service. Defined in the shared pydantic-settings config; not used directly by the model service itself but available for tooling. |
 
 <Warning>
 Always set `MLFLOW_TRACKING_URI` to the **Dockerised** MLflow instance (`http://localhost:5000`) when running model registration scripts. Registering against a local MLflow process records host-absolute artifact paths that containers cannot resolve. See the [troubleshooting guide](/reference/troubleshooting) for the full explanation.

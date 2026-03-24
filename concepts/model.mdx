@@ -19,13 +19,13 @@ model.eval()
 
 The model classifies returned items into five categories:
 
-<Columns cols={3}>
+<CardGroup cols={3}>
   <Card title="Casual Shoes" icon="shoe-prints" />
   <Card title="Handbags" icon="shopping-bag" />
   <Card title="Shirts" icon="shirt" />
   <Card title="Tops" icon="person" />
   <Card title="Watches" icon="clock" />
-</Columns>
+</CardGroup>
 
 ## Performance
 
@@ -106,17 +106,21 @@ The Model Service wraps predictions in a `PredictResponse`. Each prediction obje
 
 ```json
 {
-  "predicted_class": "shirts",
+  "predicted_class": "Shirts",
   "confidence": 0.9821,
   "all_probabilities": {
-    "casual shoes": 0.0031,
-    "handbags": 0.0048,
-    "shirts": 0.9821,
-    "tops": 0.0074,
-    "watches": 0.0026
+    "Casual Shoes": 0.0031,
+    "Handbags": 0.0048,
+    "Shirts": 0.9821,
+    "Tops": 0.0074,
+    "Watches": 0.0026
   }
 }
 ```
+
+<Note>
+The exact class name strings depend on the folder names in the training dataset (`data/processed/train/`). Verify the actual names by inspecting `checkpoint["class_to_idx"]` in the loaded model checkpoint.
+</Note>
 
 The full response from `POST /predict` also includes the `model_version` field (`"production"` or `"latest"`).
 
@@ -130,8 +134,8 @@ When you register a model with `scripts/register_model.py`, the following parame
 | Parameter | `num_classes` | `5` |
 | Parameter | `img_size` | `224` |
 | Parameter | `batch_size` | `32` |
-| Parameter | `num_epochs` | `20` |
-| Parameter | `learning_rate` | `0.001` |
+| Parameter | `num_epochs` | `15` |
+| Parameter | `learning_rate` | `0.0001` |
 | Metric | `best_val_acc` | `0.9701` |
 | Metric | `test_acc` | `0.9653` |
 

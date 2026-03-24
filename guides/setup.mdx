@@ -74,7 +74,7 @@ Two large files are hosted on Google Drive and must be downloaded before the sys
 | Asset | Size | Destination | Link |
 |---|---|---|---|
 | Training dataset | ~750 MB | `data/processed/` | [Google Drive](https://drive.google.com/drive/folders/1g1V4I3WL8FfXLZfkXqrTYcCR8etojiBY?usp=drive_link) |
-| Trained model v1 | ~50 MB | `models/v1/` | [Google Drive](https://drive.google.com/drive/folders/1IQ4wyuTYO0TuQvKg0bIZ3n1kTZQpuvtp?usp=drive_link) |
+| Trained model v1 | ~20 MB | `models/v1/` | [Google Drive](https://drive.google.com/drive/folders/1IQ4wyuTYO0TuQvKg0bIZ3n1kTZQpuvtp?usp=drive_link) |
 
 After downloading, extract each archive:
 
@@ -132,7 +132,7 @@ The model service loads its weights from MLflow at startup. You need to register
 
 ```bash
 MLFLOW_TRACKING_URI=http://localhost:5000 python scripts/register_model.py
-MLFLOW_TRACKING_URI=http://localhost:5000 python scripts/set_production.py
+python scripts/set_production.py
 ```
 
 Then restart the model service to load the newly registered model:

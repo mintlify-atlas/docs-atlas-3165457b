@@ -54,8 +54,8 @@ Two large assets are not stored in Git and must be downloaded before starting th
 
 | Asset | Size | Destination | Link |
 |---|---|---|---|
-| Training dataset | ~1 GB | `data/processed/` | [Google Drive](https://drive.google.com/drive/folders/1g1V4I3WL8FfXLZfkXqrTYcCR8etojiBY?usp=drive_link) |
-| Trained model v1 | ~50 MB | `models/v1/` | [Google Drive](https://drive.google.com/drive/folders/1IQ4wyuTYO0TuQvKg0bIZ3n1kTZQpuvtp?usp=drive_link) |
+| Training dataset | ~750 MB | `data/processed/` | [Google Drive](https://drive.google.com/drive/folders/1g1V4I3WL8FfXLZfkXqrTYcCR8etojiBY?usp=drive_link) |
+| Trained model v1 | ~20 MB | `models/v1/` | [Google Drive](https://drive.google.com/drive/folders/1IQ4wyuTYO0TuQvKg0bIZ3n1kTZQpuvtp?usp=drive_link) |
 
 After downloading, confirm the expected files are in place:
 
@@ -110,10 +110,10 @@ Always run these scripts while the Dockerised MLflow server is running and with 
 
 ```bash
 MLFLOW_TRACKING_URI=http://localhost:5000 python scripts/register_model.py
-MLFLOW_TRACKING_URI=http://localhost:5000 python scripts/set_production.py
+python scripts/set_production.py
 ```
 
-`register_model.py` logs training parameters, metrics, and the model artifact to MLflow. `set_production.py` assigns the `production` alias to version 1, which is what the model service queries at boot.
+`register_model.py` logs training parameters, metrics, and the model artifact to MLflow. `set_production.py` assigns the `production` alias to version 1 (it uses `http://127.0.0.1:5000` internally, so no env var is needed).
 
 You should see output like:
 

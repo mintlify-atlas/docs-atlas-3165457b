@@ -48,7 +48,7 @@ Artifact URIs cannot be edited after the fact. Simply restarting the MLflow serv
   <Step title="Re-register the model against the Docker MLflow instance">
     ```bash
     MLFLOW_TRACKING_URI=http://localhost:5000 python scripts/register_model.py
-    MLFLOW_TRACKING_URI=http://localhost:5000 python scripts/set_production.py
+    python scripts/set_production.py
     ```
 
     The new artifact URI will be recorded as `mlflow-artifacts:/...`, which the MLflow server resolves over HTTP regardless of filesystem paths.
@@ -129,7 +129,7 @@ Artifact URIs cannot be edited after the fact. Simply restarting the MLflow serv
 3. If the alias is missing, set it:
 
    ```bash
-   MLFLOW_TRACKING_URI=http://localhost:5000 python scripts/set_production.py
+   python scripts/set_production.py
    ```
 
 4. Restart the model service to trigger a fresh model load:
@@ -196,7 +196,7 @@ You must delete both the registered model **and** the experiment that contains t
 
    ```bash
    MLFLOW_TRACKING_URI=http://localhost:5000 python scripts/register_model.py
-   MLFLOW_TRACKING_URI=http://localhost:5000 python scripts/set_production.py
+   python scripts/set_production.py
    ```
 
 5. Restart the model service:

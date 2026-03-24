@@ -150,20 +150,22 @@ images_processed_total 317.0
 The monitoring stack scrapes the model service every 15 seconds. The relevant section from `monitoring/prometheus.yml`:
 
 ```yaml
+global:
+  scrape_interval: 15s
+
 scrape_configs:
   - job_name: 'model_service'
     static_configs:
-      - targets: ['model-service:8000']
-    scrape_interval: 15s
+      - targets: ['<host-ip>:8000']   # replace with your host IP or host.docker.internal
+    metrics_path: '/metrics'
 
   - job_name: 'pushgateway'
     static_configs:
       - targets: ['pushgateway:9091']
-    scrape_interval: 15s
 ```
 
 <Note>
-  The target `model-service:8000` resolves because Prometheus runs on the same Docker network (`ml-network`) as the model service. If you run Prometheus outside the Docker network, replace `model-service:8000` with `host.docker.internal:8000` or the host machine's IP address.
+  The monitoring stack runs in its own Docker network, separate from `ml-network`. It cannot reach `model-service` by hostname. Set the target to `host.docker.internal:8000` (macOS/Windows) or your WSL/Linux host IP. See the [monitoring guide](/guides/monitoring) for how to find the correct IP.
 </Note>
 
 Prometheus scrapes `/metrics` directly — there is no separate path to configure. The batch orchestrator pushes its own metrics to Pushgateway (`pushgateway:9091`) separately; those metrics appear under the `pushgateway` job, not `model_service`.

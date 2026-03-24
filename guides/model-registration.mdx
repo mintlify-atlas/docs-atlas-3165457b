@@ -152,7 +152,7 @@ class RefundClassifer(mlflow.pyfunc.PythonModel):
 <Step title="Run set_production.py">
 
 ```bash
-MLFLOW_TRACKING_URI=http://localhost:5000 python scripts/set_production.py
+python scripts/set_production.py
 ```
 
 Expected output:
@@ -172,6 +172,10 @@ client.set_registered_model_alias(
     version="1"
 )
 ```
+
+<Note>
+  `set_production.py` hardcodes `http://127.0.0.1:5000` as the tracking URI internally. It does not read `MLFLOW_TRACKING_URI` from the environment, so you do not need to set that variable when running this script. Make sure the Docker MLflow server is accessible at `http://localhost:5000` before running it.
+</Note>
 
 The model service loads via the alias URI `models:/refund-classifier@production`. If the alias is not set, the service falls back to `models:/refund-classifier@latest` but will log a warning.
 
@@ -248,7 +252,7 @@ docker compose ps
 
 ```bash
 MLFLOW_TRACKING_URI=http://localhost:5000 python scripts/register_model.py
-MLFLOW_TRACKING_URI=http://localhost:5000 python scripts/set_production.py
+python scripts/set_production.py
 docker compose restart model-service
 ```
 

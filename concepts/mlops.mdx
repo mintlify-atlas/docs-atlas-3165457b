@@ -59,7 +59,7 @@ The `mlflow_data/artifacts/` volume is mounted only for persistence — so artif
 
 ```bash
 MLFLOW_TRACKING_URI=http://localhost:5000 python scripts/register_model.py
-MLFLOW_TRACKING_URI=http://localhost:5000 python scripts/set_production.py
+python scripts/set_production.py
 ```
 
 ## Model promotion workflow
@@ -76,7 +76,7 @@ MLFLOW_TRACKING_URI=http://localhost:5000 python scripts/set_production.py
     Run `scripts/set_production.py` to assign the `@production` alias to the version you just registered.
 
     ```bash
-    MLFLOW_TRACKING_URI=http://localhost:5000 python scripts/set_production.py
+    python scripts/set_production.py
     ```
 
     You can also set the alias directly in Python:
