@@ -1,0 +1,275 @@
+---
+title: MLOps
+description: How Autorma handles experiment tracking, model promotion, batch orchestration, idempotency, and monitoring using MLflow, Prometheus, and Grafana.
+---
+
+## MLOps architecture overview
+
+Autorma applies MLOps practices at every stage of the model lifecycle:
+
+- **MLflow** tracks experiments, stores model artifacts, and manages the model registry
+- **The Batch Orchestrator** runs scheduled inference with checkpoint-based crash recovery
+- **Prometheus and Grafana** provide real-time visibility into service health and batch outcomes
+
+These three concerns are deliberately kept separate so you can update, scale, or replace each independently.
+
+## MLflow
+
+### Experiment tracking
+
+Every call to `scripts/register_model.py` opens an MLflow run under the `refund-classifier` experiment and logs parameters (architecture, image size, batch size, learning rate), metrics (validation accuracy, test accuracy, per-epoch curves), and the `training_metadata.json` artifact.
+
+This gives you a permanent, queryable record of every model you have trained. You can compare runs in the MLflow UI at `http://localhost:5000`.
+
+### Model registry
+
+After logging the run, `register_model.py` registers the model under the name `refund-classifier`. MLflow assigns it a version number (1, 2, 3, …). Versions are immutable — you cannot overwrite a registered version, only create a new one.
+
+### Artifact proxy (`--serve-artifacts`)
+
+This flag is non-negotiable for Docker deployments.
+
+<Warning>
+Always register your model while the Dockerised MLflow server is running. Registering against a locally-run (non-Docker) MLflow instance records artifact URIs as absolute host paths. Containers cannot resolve those paths and the Model Service will fail to load.
+</Warning>
+
+**Why `--serve-artifacts` is required:** artifact URIs are recorded at log time, not serve time. When you call `mlflow.pyfunc.log_model(...)`, MLflow writes the artifact to disk and records its location in the database. If the server is running without `--serve-artifacts`, it records a `file://` URI pointing to that exact path on the host.
+
+When the Model Service (running inside Docker) later calls `mlflow.pyfunc.load_model("models:/refund-classifier@production")`, MLflow resolves the alias to a version, looks up the recorded artifact URI, and tries to download it. A `file://` URI tells the client to read directly from disk — which fails because the container does not mount `mlflow_data/artifacts/` at the same path as the host.
+
+With `--serve-artifacts`, MLflow records `mlflow-artifacts://` URIs instead and acts as an HTTP proxy for all artifact downloads. Every client — host or container — downloads artifacts over HTTP from the MLflow server. No direct filesystem access is needed.
+
+```bash
+# Correct MLflow server startup command
+mlflow server \
+  --backend-store-uri sqlite:////mlflow_data/mlflow.db \
+  --artifacts-destination file:///mlflow_data/artifacts \
+  --serve-artifacts \
+  --host 0.0.0.0 \
+  --port 5000
+```
+
+<Note>
+The `mlflow_data/artifacts/` volume is mounted only for persistence — so artifact files survive container restarts. The server, not the client, reads from that path.
+</Note>
+
+**Why `--default-artifact-root` is not enough:** `--default-artifact-root` controls where new artifacts are stored but still returns `file://` URIs to clients. The client still needs direct disk access. Use `--artifacts-destination` together with `--serve-artifacts` to give the server full ownership of the download path.
+
+**The key rule: artifact URIs are immutable once written.** Changing `--serve-artifacts` on an existing MLflow instance only affects new experiments. Old registered models retain their original `file://` URIs. If you hit this situation, delete the registered model and its experiment from the MLflow UI, then re-register:
+
+```bash
+MLFLOW_TRACKING_URI=http://localhost:5000 python scripts/register_model.py
+MLFLOW_TRACKING_URI=http://localhost:5000 python scripts/set_production.py
+```
+
+## Model promotion workflow
+
+<Steps>
+  <Step title="Train and register">
+    Run `scripts/register_model.py` while Docker services are up. The script logs the run, uploads the model artifact, and registers the model as a new version.
+
+    ```bash
+    MLFLOW_TRACKING_URI=http://localhost:5000 python scripts/register_model.py
+    ```
+  </Step>
+  <Step title="Set the production alias">
+    Run `scripts/set_production.py` to assign the `@production` alias to the version you just registered.
+
+    ```bash
+    MLFLOW_TRACKING_URI=http://localhost:5000 python scripts/set_production.py
+    ```
+
+    You can also set the alias directly in Python:
+
+    ```python
+    import mlflow
+
+    mlflow.set_tracking_uri("http://localhost:5000")
+    client = mlflow.MlflowClient()
+    client.set_registered_model_alias("refund-classifier", "production", "2")
+    ```
+  </Step>
+  <Step title="Restart the Model Service">
+    The service reads `@production` once at startup. Restart it to load the newly promoted version.
+
+    ```bash
+    docker compose restart model-service
+    ```
+  </Step>
+  <Step title="Verify">
+    ```bash
+    curl http://localhost:8000/health
+    # {"status": "healthy", "model_loaded": true, "model_version": "production"}
+    ```
+  </Step>
+</Steps>
+
+## Rollback workflow
+
+Rollback is alias reassignment followed by a service restart. No code changes are needed.
+
+<Steps>
+  <Step title="Reassign the alias">
+    Point `@production` at the version you want to restore:
+
+    ```python
+    client.set_registered_model_alias("refund-classifier", "production", "1")
+    ```
+  </Step>
+  <Step title="Restart the Model Service">
+    ```bash
+    docker compose restart model-service
+    ```
+  </Step>
+</Steps>
+
+## Batch orchestration
+
+### BatchOrchestrator class
+
+The `BatchOrchestrator` class in `orchestrator/batch_inference.py` drives the full batch inference lifecycle:
+
+1. Checks the Model Service health endpoint before doing any work
+2. Loads the checkpoint to find already-processed images
+3. Scans `data/inference/input/` for `.jpg` and `.png` files
+4. Filters out names already in the checkpoint
+5. Splits remaining images into batches of `BATCH_SIZE` (default: 10)
+6. For each batch: calls `POST /predict`, collects results, updates the checkpoint
+7. Writes a timestamped results JSON to `data/inference/output/`
+8. Pushes metrics to the Pushgateway
+
+The orchestrator runs with Docker's `--profile manual` flag — it starts on demand and exits after one pass. It has no persistent process.
+
+### Checkpoint-based idempotency
+
+The checkpoint is a JSON file at `data/inference/checkpoints/checkpoint.json`. It tracks which image file names have been processed:
+
+```json
+{
+  "processed_images": [
+    "item_001.jpg",
+    "item_002.jpg",
+    "item_003.jpg"
+  ],
+  "last_run": "2026-03-24T02:14:37.821456"
+}
+```
+
+The orchestrator writes the checkpoint after every individual batch, not just at the end of the run. If the container crashes mid-run, the next invocation skips any images whose names are already in `processed_images`. At most one batch's worth of images needs to be re-processed.
+
+To force a full rerun:
+
+```bash
+rm data/inference/checkpoints/checkpoint.json
+```
+
+### Output format
+
+Each run produces a timestamped file at `data/inference/output/predictions_<timestamp>.json`:
+
+```json
+{
+  "run_timestamp": "20260324_021502",
+  "total_images": 50,
+  "successful": 49,
+  "failed": 1,
+  "duration_seconds": 12.4,
+  "predictions": [
+    {
+      "image_name": "item_001.jpg",
+      "image_path": "data/inference/input/item_001.jpg",
+      "predicted_class": "shirts",
+      "confidence": 0.9821,
+      "probabilities": { "shirts": 0.9821, "tops": 0.0074, "..." : "..." },
+      "batch_number": 1,
+      "processed_at": "2026-03-24T02:15:03.412100"
+    }
+  ],
+  "failed_images": []
+}
+```
+
+## Metrics and monitoring
+
+### Metrics pushed after each batch run
+
+After all batches complete, the orchestrator uses `MetricsPusher` to push the following to the Pushgateway:
+
+- Batch duration in seconds
+- Total images processed
+- Successful predictions
+- Failed predictions
+- Class distribution (count per class)
+
+### Prometheus scrape configuration
+
+Prometheus scrapes two targets:
+
+```yaml
+scrape_configs:
+  - job_name: 'model_service'
+    static_configs:
+      - targets: ['model-service:8000']
+    scrape_interval: 15s
+
+  - job_name: 'pushgateway'
+    static_configs:
+      - targets: ['pushgateway:9091']
+    scrape_interval: 15s
+```
+
+<Note>
+If you run Prometheus outside the `ml-network` (e.g. in the monitoring stack's own Compose network), use `host.docker.internal:8000` or the WSL IP instead of `model-service:8000`.
+</Note>
+
+### Metrics exposed by the Model Service
+
+The `/metrics` endpoint on the Model Service (port 8000) exposes these Prometheus metrics:
+
+| Metric | Type | Description |
+|---|---|---|
+| `api_requests_total{endpoint,status}` | Counter | All requests by endpoint and status |
+| `api_request_duration_seconds{endpoint}` | Histogram | Latency per endpoint |
+| `prediction_confidence` | Histogram | Distribution of confidence scores |
+| `predictions_by_class_total{class_name}` | Counter | Per-class prediction counts |
+| `model_loaded` | Gauge | 1 if model is loaded, 0 otherwise |
+| `images_processed_total` | Counter | Cumulative images processed |
+
+### Grafana dashboards
+
+Grafana (port 3000, default credentials `admin`/`admin`) reads from Prometheus and provides dashboards for:
+
+- Request rate and error rate
+- Request latency (p50, p95)
+- Prediction class distribution
+- Batch success rate and duration
+
+<Tip>
+If Grafana shows no data, run a batch job to generate traffic first, then expand the time range to **Last 6 hours**.
+</Tip>
+
+## Scalability considerations
+
+### Current capacity
+
+The current setup runs a single CPU-only Model Service instance with a batch size of 10. Estimated throughput is approximately 10 images per second, giving around 36,000 images per hour. A 6-hour nightly window handles roughly 216,000 images — well beyond current requirements.
+
+### Path to scaling
+
+<AccordionGroup>
+  <Accordion title="Vertical scaling">
+    Increasing available RAM allows larger batch sizes. Adding a GPU gives 10–100x faster inference with no code changes — the model already runs on CPU only as a configuration choice, not an architectural constraint.
+  </Accordion>
+
+  <Accordion title="Horizontal scaling">
+    Run multiple `model-service` replicas behind a load balancer. The orchestrator can round-robin across service URLs. The MLflow server and filesystem storage remain shared state and do not need to change.
+  </Accordion>
+
+  <Accordion title="Cloud migration">
+    Replace the local `mlflow_data/artifacts/` volume with S3. Set `--artifacts-destination s3://bucket/mlflow-artifacts` on the MLflow server. Replace the model-service container with SageMaker or Cloud Run. Everything else — the registry, the alias-based promotion workflow, the orchestrator — stays the same.
+  </Accordion>
+</AccordionGroup>
+
+<Note>
+Do not scale prematurely. The current architecture handles 10x current load without changes.
+</Note>

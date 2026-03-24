@@ -1,80 +1,218 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: Quickstart
+description: Get Autorma running on your machine, from clone to first batch inference.
 ---
 
-## Get started in three steps
+This guide walks you through standing up the full Autorma stack locally — MLflow, the model service, and the batch orchestrator — and running your first classification job.
 
-Get your documentation site running locally and make your first customization.
+## Prerequisites
 
-### Step 1: Set up your local environment
+Before you start, make sure you have the following installed and ready:
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+- **Docker** and **Docker Compose** (Docker Desktop works on macOS and Windows)
+- **Python 3.12+** with [uv](https://docs.astral.sh/uv/) for dependency management
+- **8 GB RAM** minimum (the model service loads a PyTorch model at startup)
+- Downloaded assets — see step 4 below
 
-### Step 2: Deploy your changes
+<Steps>
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+<Step title="Clone the repository and install dependencies">
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+Clone the repo and use `uv` to install all Python dependencies into a managed virtual environment:
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+```bash
+git clone https://github.com/DanielPopoola/autorma.git
+cd autorma
+uv sync
+```
 
-### Step 3: Go live
+`uv sync` reads `pyproject.toml` and installs the full dependency set, including PyTorch, FastAPI, MLflow, Streamlit, and Timm.
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+</Step>
 
-## Next steps
+<Step title="Create required directories">
 
-Now that you have your docs running, explore these key features:
+Several directories are expected at runtime but are not committed to the repository. Create them all in one command:
 
-<CardGroup cols={2}>
+```bash
+mkdir -p data/inference/{input,output,checkpoints} mlflow_data/artifacts logs
+```
 
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
+| Directory | Purpose |
+|---|---|
+| `data/inference/input/` | Drop images here before running a batch job |
+| `data/inference/output/` | JSON results are written here after each batch |
+| `data/inference/checkpoints/` | Checkpoint file so re-runs skip already-processed images |
+| `mlflow_data/artifacts/` | MLflow artifact storage, mounted into the MLflow container |
+| `logs/` | Orchestrator and cron job logs |
 
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
+</Step>
 
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
+<Step title="Download required assets">
 
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
+Two large assets are not stored in Git and must be downloaded before starting the services.
 
-</CardGroup>
+| Asset | Size | Destination | Link |
+|---|---|---|---|
+| Training dataset | ~1 GB | `data/processed/` | [Google Drive](https://drive.google.com/drive/folders/1g1V4I3WL8FfXLZfkXqrTYcCR8etojiBY?usp=drive_link) |
+| Trained model v1 | ~50 MB | `models/v1/` | [Google Drive](https://drive.google.com/drive/folders/1IQ4wyuTYO0TuQvKg0bIZ3n1kTZQpuvtp?usp=drive_link) |
+
+After downloading, confirm the expected files are in place:
+
+```bash
+ls models/v1/
+# best_model.pth  training_metadata.json
+
+ls data/processed/
+# test/  train/  val/  (directories with .jpg images)
+```
 
 <Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
+The training dataset is only needed to run batch jobs against real sample images. The model service itself only requires the files in `models/v1/`.
 </Note>
+
+</Step>
+
+<Step title="Start the core Docker services">
+
+Build and start MLflow and the model service in detached mode:
+
+```bash
+docker compose up --build -d
+```
+
+The first build takes roughly 60 seconds because it downloads and installs PyTorch inside the container image. Subsequent starts are fast.
+
+Once the build completes, wait for both services to pass their health checks:
+
+```bash
+docker compose ps
+```
+
+You are looking for `healthy` in the **Status** column for both `mlflow-server` and `model-service`. If a service shows `starting`, wait 30 seconds and run the command again.
+
+When both are healthy, the following interfaces are available:
+
+| Service | URL |
+|---|---|
+| MLflow UI | http://localhost:5000 |
+| Model service API docs | http://localhost:8000/docs |
+
+</Step>
+
+<Step title="Register the model with MLflow">
+
+This step logs the EfficientNet-B0 model to MLflow, registers it under the name `refund-classifier`, and promotes version 1 to the `production` alias that the model service reads at startup.
+
+<Warning>
+Always run these scripts while the Dockerised MLflow server is running and with `MLFLOW_TRACKING_URI` pointing to `http://localhost:5000`. Registering against a locally-started MLflow instance records host-absolute artifact paths that the containers cannot resolve, causing the model service to fail to load.
+</Warning>
+
+```bash
+MLFLOW_TRACKING_URI=http://localhost:5000 python scripts/register_model.py
+MLFLOW_TRACKING_URI=http://localhost:5000 python scripts/set_production.py
+```
+
+`register_model.py` logs training parameters, metrics, and the model artifact to MLflow. `set_production.py` assigns the `production` alias to version 1, which is what the model service queries at boot.
+
+You should see output like:
+
+```
+Model registered successfully!
+  Run ID: <run-id>
+  Model URI: runs:/<run-id>/model
+✓ Set version 1 to production alias
+```
+
+<Note>
+You only need to run this once — or again after clearing the MLflow database. If you re-register, increment the version number or delete the previous registration first via the MLflow UI.
+</Note>
+
+</Step>
+
+<Step title="Restart the model service and verify">
+
+The model service loads the production model at startup. Since it started before the model was registered, restart it now:
+
+```bash
+docker compose restart model-service
+```
+
+Wait about 20 seconds for the container to reinitialise, then verify it loaded the model successfully:
+
+```bash
+curl http://localhost:8000/health
+```
+
+A successful response looks like:
+
+```json
+{"status": "healthy", "model_loaded": true}
+```
+
+If `model_loaded` is `false`, check the container logs:
+
+```bash
+docker logs model-service
+```
+
+The most common cause is the model being registered against a non-Docker MLflow instance. See the [troubleshooting guide](/reference/troubleshooting) for the fix.
+
+</Step>
+
+<Step title="Run your first batch job">
+
+Populate the input directory with sample images from the test dataset, then trigger the orchestrator:
+
+```bash
+# Copy 50 random test images into the inference input directory
+find data/processed/test -name "*.jpg" | shuf -n 50 | xargs -I {} cp {} data/inference/input/
+
+# Run the orchestrator as a one-shot container
+docker compose --profile manual up orchestrator
+```
+
+The orchestrator sends each image to the model service, collects predictions, and writes results to `data/inference/output/` as JSON. It also saves a checkpoint to `data/inference/checkpoints/checkpoint.json` so that re-running the same command skips already-processed images.
+
+Inspect the results:
+
+```bash
+ls data/inference/output/
+cat data/inference/output/<batch-result>.json
+```
+
+Each result entry contains the predicted class, confidence score, and per-class probabilities for one image.
+
+</Step>
+
+</Steps>
+
+## Optional: start the Streamlit UI
+
+The Streamlit UI lets you trigger batch jobs and browse results through a browser interface rather than the command line:
+
+```bash
+streamlit run streamlit-ui/app.py
+```
+
+Open http://localhost:8501 in your browser.
+
+## Optional: start the monitoring stack
+
+Prometheus, Pushgateway, and Grafana run as a separate Compose project in the `monitoring/` directory:
+
+```bash
+docker compose -f monitoring/docker-compose.yml up -d
+```
+
+Once running, open Grafana at http://localhost:3000 and log in with **admin** / **admin**. The pre-built dashboard shows request rate, latency, class distribution, and batch success rate.
+
+<Note>
+Grafana will show no data until you run a batch job. After running one, expand the time range to **Last 6 hours** if the panels appear empty.
+</Note>
+
+| Service | URL |
+|---|---|
+| Prometheus | http://localhost:9090 |
+| Pushgateway | http://localhost:9091 |
+| Grafana | http://localhost:3000 |

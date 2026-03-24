@@ -1,0 +1,257 @@
+---
+title: Model registration
+description: Register a trained model with MLflow and promote it to the production alias so the model service can load it.
+---
+
+The model service loads weights from MLflow at startup using the `@production` alias. Before you can run inference, you need to register the model checkpoint and set that alias. This only needs to be done once — or again after clearing the MLflow database or training a new model version.
+
+## When to register
+
+Register the model:
+
+- On first setup, after starting Docker services for the first time
+- After deleting the MLflow database (`mlflow_data/`)
+- After training a new model and wanting to deploy it
+
+## Critical requirement: register against Docker MLflow
+
+<Warning>
+  Always run the registration scripts while the Docker MLflow server is running and with `MLFLOW_TRACKING_URI=http://localhost:5000` set. **Do not** run them against a locally-started MLflow instance.
+
+  MLflow records artifact paths at log time, not load time. If you register against a local MLflow server, it writes a host-absolute filesystem path (e.g., `/home/youruser/autorma/mlflow_data/artifacts/...`) into the database. When the model service container later tries to load that artifact, it looks for that path inside the container — which doesn't exist — and fails with `OSError: No such file or directory`.
+
+  When you register against the Docker MLflow server (which runs with `--serve-artifacts`), it records an `mlflow-artifacts:/` URI instead. The model service fetches the artifact over HTTP through the MLflow proxy, which works from any container.
+</Warning>
+
+## Registration steps
+
+<Steps>
+
+<Step title="Confirm Docker services are running">
+
+```bash
+docker compose ps
+```
+
+Both `mlflow-server` and `model-service` should show status `healthy`. If they are not running, start them first:
+
+```bash
+docker compose up -d
+```
+
+</Step>
+
+<Step title="Run register_model.py">
+
+```bash
+MLFLOW_TRACKING_URI=http://localhost:5000 python scripts/register_model.py
+```
+
+Expected output:
+
+```
+Model registered successfully!
+  Run ID: <run-id>
+  Model URI: runs:/<run-id>/model
+```
+
+### What register_model.py does
+
+The script loads `models/v1/training_metadata.json`, starts an MLflow run named `efficientnet_b0_v1` in the `refund-classifier` experiment, and logs the following:
+
+**Parameters logged:**
+
+| Parameter | Example value |
+|---|---|
+| `model_architecture` | `efficientnet_b0` |
+| `num_classes` | `5` |
+| `img_size` | `224` |
+| `batch_size` | `32` |
+| `num_epochs` | `15` |
+| `learning_rate` | `0.0001` |
+
+**Metrics logged:**
+
+| Metric | Description |
+|---|---|
+| `best_val_acc` | Best validation accuracy across all epochs |
+| `test_acc` | Final test set accuracy |
+| `final_train_acc` | Training accuracy at the last epoch |
+| `final_val_acc` | Validation accuracy at the last epoch |
+| `epoch_train_loss` | Per-epoch training loss |
+| `epoch_val_loss` | Per-epoch validation loss |
+| `epoch_train_acc` | Per-epoch training accuracy |
+| `epoch_val_acc` | Per-epoch validation accuracy |
+
+**Artifacts logged:**
+
+- `training_metadata.json` — hyperparameters and training history
+- The model itself, wrapped as an MLflow pyfunc model
+
+### The RefundClassifier pyfunc class
+
+The script defines `RefundClassifier` inline as an `mlflow.pyfunc.PythonModel` subclass. This wrapper is what MLflow serialises and what the model service loads.
+
+```python
+class RefundClassifer(mlflow.pyfunc.PythonModel):
+    def load_context(self, context):
+        import timm
+        from torchvision import transforms
+
+        self.device = "cpu"
+        checkpoint = torch.load(
+            context.artifacts["model"], map_location=self.device
+        )
+
+        self.model = timm.create_model(
+            "efficientnet_b0", pretrained=False, num_classes=5
+        )
+        self.model.load_state_dict(checkpoint["model_state_dict"])
+        self.model.eval()
+
+        self.class_to_idx = checkpoint["class_to_idx"]
+        self.idx_to_class = {v: k for k, v in self.class_to_idx.items()}
+
+        self.transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ])
+
+    def predict(self, context, model_input):
+        from PIL import Image
+
+        predictions = []
+        for img_path in model_input["image_paths"]:
+            img = Image.open(img_path).convert("RGB")
+            img_tensor = self.transform(img).unsqueeze(0)
+
+            with torch.no_grad():
+                output = self.model(img_tensor)
+                probs = torch.softmax(output, dim=1)[0]
+                pred_idx = torch.argmax(probs).item()
+
+            predictions.append({
+                "predicted_class": self.idx_to_class[pred_idx],
+                "confidence": float(probs[pred_idx]),
+                "all_probabilities": {
+                    self.idx_to_class[i]: float(probs[i])
+                    for i in range(len(probs))
+                },
+            })
+
+        return predictions
+```
+
+`load_context` runs once at startup: it loads the `.pth` checkpoint, builds the EfficientNet-B0 architecture with `timm`, restores the weights, and sets up the preprocessing transform.
+
+`predict` accepts a dict with an `image_paths` key (a list of absolute file paths), opens each image with PIL, runs it through the transform and the model, and returns a list of dicts with `predicted_class`, `confidence`, and `all_probabilities`.
+
+</Step>
+
+<Step title="Run set_production.py">
+
+```bash
+MLFLOW_TRACKING_URI=http://localhost:5000 python scripts/set_production.py
+```
+
+Expected output:
+
+```
+✓ Set version 1 to production alias
+```
+
+### What set_production.py does
+
+The script sets the `production` alias on model version `1` in the `refund-classifier` registered model:
+
+```python
+client.set_registered_model_alias(
+    name="refund-classifier",
+    alias="production",
+    version="1"
+)
+```
+
+The model service loads via the alias URI `models:/refund-classifier@production`. If the alias is not set, the service falls back to `models:/refund-classifier@latest` but will log a warning.
+
+<Note>
+  MLflow 2.x uses aliases (`@production`) rather than stages (`/Production`). The old stage-based syntax is deprecated and will not work correctly.
+</Note>
+
+</Step>
+
+<Step title="Restart the model service">
+
+```bash
+docker compose restart model-service
+```
+
+The model service loads its model at startup. Restarting it causes it to pull the newly registered `@production` version from MLflow.
+
+</Step>
+
+<Step title="Verify the model loaded">
+
+```bash
+curl http://localhost:8000/health
+```
+
+Expected response:
+
+```json
+{
+  "status": "healthy",
+  "model_loaded": true,
+  "model_version": "production"
+}
+```
+
+If `model_loaded` is `false`, check the container logs:
+
+```bash
+docker logs model-service
+```
+
+</Step>
+
+</Steps>
+
+## Troubleshooting: the artifact path bug
+
+If `docker logs model-service` shows an error like:
+
+```
+OSError: No such file or directory: '/home/youruser/autorma/mlflow_data/artifacts/...'
+```
+
+The model was registered against a locally-started MLflow instance. Fix it:
+
+<Steps>
+
+<Step title="Delete the bad registration">
+
+Open the MLflow UI at `http://localhost:5000`, navigate to **Models → refund-classifier**, and delete the registered model. Also delete the experiment run under **Experiments → refund-classifier**.
+
+</Step>
+
+<Step title="Confirm Docker MLflow is running">
+
+```bash
+docker compose ps
+# mlflow-server should show "healthy"
+```
+
+</Step>
+
+<Step title="Re-register">
+
+```bash
+MLFLOW_TRACKING_URI=http://localhost:5000 python scripts/register_model.py
+MLFLOW_TRACKING_URI=http://localhost:5000 python scripts/set_production.py
+docker compose restart model-service
+```
+
+</Step>
+
+</Steps>

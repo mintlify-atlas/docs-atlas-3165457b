@@ -1,0 +1,185 @@
+---
+title: Batch inference
+description: Run the batch orchestrator to classify images in bulk, understand checkpoint-based idempotency, and schedule nightly runs with cron.
+---
+
+The orchestrator processes images from `data/inference/input/` in batches, posts them to the model service, and writes results to `data/inference/output/`. It checkpoints after each batch so that interrupted or repeated runs never reprocess the same image twice.
+
+## Overview of BatchOrchestrator
+
+`orchestrator/batch_inference.py` defines the `BatchOrchestrator` class. Its `run()` method executes the following sequence:
+
+1. Check model service health via `GET /health`
+2. Load checkpoint from `data/inference/checkpoints/checkpoint.json`
+3. Scan `data/inference/input/` for `.jpg` and `.png` files
+4. Filter out images already listed in the checkpoint
+5. Split remaining images into batches of `BATCH_SIZE` (default: 10)
+6. For each batch: POST to `/predict`, collect results, update checkpoint
+7. Write a `predictions_<timestamp>.json` results file
+8. Push metrics to Pushgateway
+
+## Running the orchestrator manually
+
+<Steps>
+
+<Step title="Populate the input directory">
+
+Copy images you want to classify into `data/inference/input/`. The orchestrator accepts `.jpg` and `.png` files.
+
+```bash
+# Example: copy 50 random test images
+find data/processed/test -name "*.jpg" | shuf -n 50 | xargs -I {} cp {} data/inference/input/
+```
+
+Or copy your own images directly:
+
+```bash
+cp /path/to/your/images/*.jpg data/inference/input/
+```
+
+</Step>
+
+<Step title="Run the orchestrator container">
+
+The orchestrator uses the `manual` Docker profile so it only starts when explicitly invoked:
+
+```bash
+docker compose --profile manual up orchestrator
+```
+
+The container exits when the batch run is complete. Results are written to `data/inference/output/`.
+
+</Step>
+
+<Step title="Check results">
+
+```bash
+ls data/inference/output/
+# predictions_20240315_020000.json
+```
+
+</Step>
+
+</Steps>
+
+## Idempotency and checkpointing
+
+The orchestrator maintains `data/inference/checkpoints/checkpoint.json` to track which images have already been processed.
+
+```json
+{
+  "processed_images": [
+    "image_001.jpg",
+    "image_002.jpg"
+  ],
+  "last_run": "2024-03-15T02:00:42.123456"
+}
+```
+
+The checkpoint is updated after **every batch**, not just at the end of the run. If a run fails halfway through, at most `BATCH_SIZE` images will be reprocessed.
+
+Running the orchestrator again when no new images have been added prints:
+
+```
+No new images to process
+```
+
+To force a full rerun of all images in the input directory:
+
+```bash
+rm data/inference/checkpoints/checkpoint.json
+```
+
+## Output file format
+
+Each run writes one file named `predictions_<YYYYMMDD_HHMMSS>.json` to `data/inference/output/`.
+
+```json
+{
+  "run_timestamp": "20240315_020042",
+  "total_images": 50,
+  "successful": 48,
+  "failed": 2,
+  "duration_seconds": 24.7,
+  "predictions": [
+    {
+      "image_name": "product_001.jpg",
+      "image_path": "/data/inference/input/product_001.jpg",
+      "predicted_class": "Shirts",
+      "confidence": 0.9821,
+      "probabilities": {
+        "Casual Shoes": 0.0032,
+        "Handbags": 0.0011,
+        "Shirts": 0.9821,
+        "Tops": 0.0098,
+        "Watches": 0.0038
+      },
+      "batch_number": 1,
+      "processed_at": "2024-03-15T02:00:45.123456"
+    }
+  ],
+  "failed_images": [
+    {
+      "image_name": "corrupt_image.jpg",
+      "batch_number": 3,
+      "error": "cannot identify image file",
+      "timestamp": "2024-03-15T02:00:51.654321"
+    }
+  ]
+}
+```
+
+### Top-level fields
+
+| Field | Type | Description |
+|---|---|---|
+| `run_timestamp` | string | Start time of the run (`YYYYMMDD_HHMMSS`) |
+| `total_images` | int | Number of new (unprocessed) images found |
+| `successful` | int | Images successfully classified |
+| `failed` | int | Images that caused errors |
+| `duration_seconds` | float | Total elapsed time |
+| `predictions` | array | One entry per successfully classified image |
+| `failed_images` | array | One entry per image that caused an error |
+
+### Prediction fields
+
+| Field | Type | Description |
+|---|---|---|
+| `image_name` | string | Filename only |
+| `image_path` | string | Absolute path inside the container |
+| `predicted_class` | string | Highest-probability class |
+| `confidence` | float | Probability of the predicted class (0–1) |
+| `probabilities` | object | Softmax probability for each of the 5 classes |
+| `batch_number` | int | Which batch this image was part of |
+| `processed_at` | string | ISO 8601 timestamp |
+
+## Configuration
+
+The orchestrator reads settings from environment variables (or an `.env` file):
+
+| Variable | Default | Description |
+|---|---|---|
+| `MODEL_SERVICE_URL` | `http://localhost:8000` | Base URL of the model service. In Docker, this is set to `http://model-service:8000` |
+| `BATCH_SIZE` | `10` | Number of images per batch sent to `/predict` |
+
+When running via Docker Compose, `MODEL_SERVICE_URL` is automatically set to `http://model-service:8000` by `docker-compose.yml`.
+
+## Scheduling with cron
+
+To run the orchestrator automatically every night at 2 AM:
+
+```bash
+crontab -e
+```
+
+Add the following line, replacing `/home/youruser/autorma` with the absolute path to your project:
+
+```bash
+0 2 * * * cd /home/youruser/autorma && docker compose --profile manual run --rm orchestrator >> logs/cron.log 2>&1
+```
+
+The `--rm` flag removes the container after it exits. Output is appended to `logs/cron.log`.
+
+<Note>
+  The cron job uses `docker compose ... run` (not `up`) so it creates a fresh container for each run and exits cleanly when done. Logs from inside the container are also written to `logs/orchestrator.log` via the volume mount.
+</Note>

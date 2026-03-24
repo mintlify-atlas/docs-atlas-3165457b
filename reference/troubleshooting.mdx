@@ -1,0 +1,292 @@
+---
+title: Troubleshooting
+description: Step-by-step fixes for known issues with the model service, orchestrator, MLflow registration, and monitoring stack.
+---
+
+This page covers every known failure mode, its root cause, and the exact steps to fix it.
+
+---
+
+## Model service issues
+
+<AccordionGroup>
+  <Accordion title='"No such file or directory" on an artifact path'>
+
+**Symptom:** The model service logs an error similar to:
+
+```
+OSError: [Errno 2] No such file or directory:
+  '/home/youruser/autorma/mlflow_data/artifacts/1/models/...'
+```
+
+The service starts but cannot load the model, and `/health` returns `"model_loaded": false`.
+
+**Root cause:** The model was registered against a local (non-Docker) MLflow instance. MLflow records artifact URIs at log time — when registration happens outside Docker, it writes an absolute host filesystem path such as `file:///home/youruser/autorma/mlflow_data/artifacts/...`. Containers cannot resolve this path because they mount the same directory at a different location, and the URI is immutable once written.
+
+<Warning>
+Artifact URIs cannot be edited after the fact. Simply restarting the MLflow server with different flags does not fix existing records. You must delete the affected experiment and registered model, then re-register.
+</Warning>
+
+**Fix:**
+
+<Steps>
+  <Step title="Ensure Docker is running">
+    ```bash
+    docker compose up -d
+    docker compose ps  # mlflow and model-service should show as running
+    ```
+  </Step>
+
+  <Step title="Open the MLflow UI and delete the registered model">
+    Go to `http://localhost:5000`, click **Models** in the top navigation, open **refund-classifier**, and click **Delete** (the trash icon). Confirm the deletion.
+  </Step>
+
+  <Step title="Delete the experiment that holds the bad artifact run">
+    Still in the MLflow UI, click **Experiments**, find the experiment used during registration, and delete it. This removes the run whose artifact URI points to the host path.
+  </Step>
+
+  <Step title="Re-register the model against the Docker MLflow instance">
+    ```bash
+    MLFLOW_TRACKING_URI=http://localhost:5000 python scripts/register_model.py
+    MLFLOW_TRACKING_URI=http://localhost:5000 python scripts/set_production.py
+    ```
+
+    The new artifact URI will be recorded as `mlflow-artifacts:/...`, which the MLflow server resolves over HTTP regardless of filesystem paths.
+  </Step>
+
+  <Step title="Restart the model service">
+    ```bash
+    docker compose restart model-service
+    ```
+  </Step>
+
+  <Step title="Verify the model loaded">
+    ```bash
+    curl http://localhost:8000/health
+    ```
+
+    The response should include `"model_loaded": true`.
+  </Step>
+</Steps>
+
+  </Accordion>
+
+  <Accordion title="Model service exits immediately">
+
+**Symptom:** The `model-service` container starts and stops within seconds. `docker compose ps` shows it as `Exited`.
+
+**Root cause:** The model service failed to load the model on startup, which causes the FastAPI lifespan handler to throw an unhandled exception and terminate the process. The most common cause is that the MLflow server was not yet healthy when the model service started, or the model is not registered.
+
+**Fix:**
+
+1. Check the logs for the specific error:
+
+   ```bash
+   docker logs model-service
+   ```
+
+2. Verify MLflow is healthy:
+
+   ```bash
+   curl http://localhost:5000
+   ```
+
+   If MLflow is not responding, wait for it to finish starting or run `docker compose restart mlflow`.
+
+3. Verify the model is registered and the `production` alias is set:
+
+   Open `http://localhost:5000`, go to **Models → refund-classifier → Aliases** and confirm `production` is listed.
+
+4. Restart the model service:
+
+   ```bash
+   docker compose restart model-service
+   ```
+
+  </Accordion>
+
+  <Accordion title="Model not loaded (model_loaded: false)">
+
+**Symptom:** The model service is running and `/health` returns HTTP 200, but the response contains `"model_loaded": false`. Calls to `/predict` return HTTP 503.
+
+**Root cause:** The model service started successfully but could not load a model — either no model is registered, the `production` alias is not set, or `MLFLOW_TRACKING_URI` points to the wrong instance.
+
+**Fix:**
+
+1. Confirm the MLflow tracking URI is correct inside the container:
+
+   ```bash
+   docker exec model-service env | grep MLFLOW_TRACKING_URI
+   # Expected: MLFLOW_TRACKING_URI=http://mlflow:5000
+   ```
+
+2. Confirm a model is registered and the `production` alias is set:
+
+   ```bash
+   curl http://localhost:5000/api/2.0/mlflow/registered-models/get?name=refund-classifier
+   ```
+
+3. If the alias is missing, set it:
+
+   ```bash
+   MLFLOW_TRACKING_URI=http://localhost:5000 python scripts/set_production.py
+   ```
+
+4. Restart the model service to trigger a fresh model load:
+
+   ```bash
+   docker compose restart model-service
+   ```
+
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Orchestrator issues
+
+<AccordionGroup>
+  <Accordion title="Orchestrator can't find images">
+
+**Symptom:** The orchestrator logs `No new images to process` or exits immediately without classifying anything, even though you placed images in the input directory.
+
+**Root cause:** The `data/inference/input/` directory on the host is mounted into the container at `/data/inference/input/`. If images are placed in the wrong host path, or the volume mount is missing, the container sees an empty directory.
+
+**Fix:**
+
+1. Confirm images are present in the correct host directory:
+
+   ```bash
+   ls data/inference/input/
+   ```
+
+2. Confirm the files are `.jpg` or `.png` — the orchestrator only processes these extensions.
+
+3. Check whether a checkpoint file is causing images to be skipped:
+
+   ```bash
+   cat data/inference/checkpoints/checkpoint.json
+   ```
+
+   If the checkpoint lists image paths that match your current input, the orchestrator considers them already processed. Delete the checkpoint to force a full rerun:
+
+   ```bash
+   rm data/inference/checkpoints/checkpoint.json
+   ```
+
+  </Accordion>
+
+  <Accordion title="Re-registration doesn't fix old artifact paths">
+
+**Symptom:** You re-ran `register_model.py` but the model service still fails with the same `No such file or directory` error.
+
+**Root cause:** MLflow artifact URIs are immutable once written. Re-registering a model creates a new version, but if the underlying experiment run that holds the model artifact has the wrong URI, the new registered version points to the same bad artifact. Adding `--serve-artifacts` to an already-running MLflow instance only affects new runs, not existing ones.
+
+**Fix:**
+
+You must delete both the registered model **and** the experiment that contains the logged run:
+
+1. In the MLflow UI (`http://localhost:5000`), go to **Models**, open **refund-classifier**, and delete every version, then delete the model itself.
+
+2. Go to **Experiments**, find the experiment containing the registration run, and delete it.
+
+3. Confirm the `mlflow_data/mlflow.db` records are cleaned up by checking that the model no longer appears at `http://localhost:5000/api/2.0/mlflow/registered-models/list`.
+
+4. Run both registration scripts fresh:
+
+   ```bash
+   MLFLOW_TRACKING_URI=http://localhost:5000 python scripts/register_model.py
+   MLFLOW_TRACKING_URI=http://localhost:5000 python scripts/set_production.py
+   ```
+
+5. Restart the model service:
+
+   ```bash
+   docker compose restart model-service
+   ```
+
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Monitoring issues
+
+<AccordionGroup>
+  <Accordion title="Grafana shows no data">
+
+**Symptom:** All Grafana panels display **No data** or an empty graph.
+
+**Root cause:** Either no traffic has been generated yet (Prometheus has nothing to collect), the time range is too narrow to show any data points, or the Prometheus data source is not configured in Grafana.
+
+**Fix:**
+
+1. Generate traffic by running a batch job:
+
+   ```bash
+   docker compose --profile manual up orchestrator
+   ```
+
+   Or send a test request directly:
+
+   ```bash
+   curl -X POST http://localhost:8000/predict \
+     -H "Content-Type: application/json" \
+     -d '{"image_paths": ["/data/inference/input/test.jpg"]}'
+   ```
+
+2. In Grafana, set the time range to **Last 6 hours**.
+
+3. Verify the Prometheus data source is configured in Grafana:
+   - Go to **Connections → Data sources**
+   - Confirm a Prometheus source pointing to `http://prometheus:9090` (or `http://localhost:9090`) exists and passes the **Test** check.
+
+4. Check Prometheus is actually scraping targets successfully at `http://localhost:9090/targets`. All targets should show state **UP**. If a target is **DOWN**, see the networking issue below.
+
+  </Accordion>
+
+  <Accordion title="Prometheus can't scrape the model service">
+
+**Symptom:** The `model_service` target on `http://localhost:9090/targets` shows state **DOWN** with a connection refused or no route to host error.
+
+**Root cause:** The monitoring stack runs in its own Docker network, separate from `ml-network`. The hostname `model-service` is not resolvable from outside `ml-network`, and `localhost` inside a Prometheus container refers to the container itself — not the host machine. On WSL, the container network stack is further isolated from the host.
+
+**Fix:**
+
+Update the `model_service` target in `monitoring/prometheus.yml` to use an address reachable from the Prometheus container:
+
+**macOS / Windows:**
+
+```yaml
+scrape_configs:
+  - job_name: 'model_service'
+    static_configs:
+      - targets: ['host.docker.internal:8000']
+    metrics_path: '/metrics'
+```
+
+**Linux / WSL:**
+
+```bash
+# Get the WSL network interface IP
+ip addr show eth0 | grep -oP '(?<=inet\s)\d+(\.\d+){3}'
+```
+
+Then update `prometheus.yml` to use that IP:
+
+```yaml
+scrape_configs:
+  - job_name: 'model_service'
+    static_configs:
+      - targets: ['172.18.x.x:8000']   # replace with your WSL IP
+    metrics_path: '/metrics'
+```
+
+After editing, restart Prometheus:
+
+```bash
+docker compose -f monitoring/docker-compose.yml restart prometheus
+```
+
+  </Accordion>
+</AccordionGroup>

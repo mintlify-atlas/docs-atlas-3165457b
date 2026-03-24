@@ -1,0 +1,215 @@
+---
+title: Model
+description: EfficientNet-B0 architecture, classification categories, inference pipeline, MLflow integration, and rollback procedure.
+---
+
+## Model architecture
+
+Autorma uses **EfficientNet-B0** loaded from the [`timm`](https://github.com/huggingface/pytorch-image-models) library. The final classification head is replaced with a 5-class linear layer. The model runs on CPU at inference time.
+
+```python
+import timm
+
+model = timm.create_model("efficientnet_b0", pretrained=False, num_classes=5)
+model.load_state_dict(checkpoint["model_state_dict"])
+model.eval()
+```
+
+## Classification categories
+
+The model classifies returned items into five categories:
+
+<Columns cols={3}>
+  <Card title="Casual Shoes" icon="shoe-prints" />
+  <Card title="Handbags" icon="shopping-bag" />
+  <Card title="Shirts" icon="shirt" />
+  <Card title="Tops" icon="person" />
+  <Card title="Watches" icon="clock" />
+</Columns>
+
+## Performance
+
+The model achieves **96.53% test accuracy** on the held-out test set. Training metadata is logged to MLflow for every registered run, including per-epoch training and validation curves.
+
+## Input preprocessing
+
+Every image goes through a fixed transform pipeline before reaching the model:
+
+```python
+from torchvision import transforms
+
+transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225]
+    ),
+])
+```
+
+The normalization values are the ImageNet channel means and standard deviations. EfficientNet-B0 was pre-trained on ImageNet, so using these values keeps the input distribution consistent with pre-training.
+
+## Inference pipeline
+
+<Steps>
+  <Step title="Load image">
+    The model receives a file path. It opens the image with PIL and converts to RGB:
+
+    ```python
+    from PIL import Image
+    img = Image.open(img_path).convert("RGB")
+    ```
+  </Step>
+  <Step title="Transform">
+    The image is resized to 224×224, converted to a tensor, normalized, and given a batch dimension:
+
+    ```python
+    img_tensor = transform(img).unsqueeze(0)  # shape: (1, 3, 224, 224)
+    ```
+  </Step>
+  <Step title="Forward pass">
+    The tensor is passed through the model with gradient tracking disabled:
+
+    ```python
+    with torch.no_grad():
+        output = model(img_tensor)
+    ```
+  </Step>
+  <Step title="Softmax and argmax">
+    Raw logits are converted to probabilities via softmax. The class with the highest probability is selected:
+
+    ```python
+    probs = torch.softmax(output, dim=1)[0]
+    pred_idx = torch.argmax(probs).item()
+    ```
+  </Step>
+  <Step title="Return prediction">
+    The result includes the predicted class name, its confidence score, and the full probability distribution across all five classes:
+
+    ```python
+    {
+        "predicted_class": idx_to_class[pred_idx],
+        "confidence": float(probs[pred_idx]),
+        "all_probabilities": {
+            idx_to_class[i]: float(probs[i])
+            for i in range(len(probs))
+        }
+    }
+    ```
+  </Step>
+</Steps>
+
+## Output format
+
+The Model Service wraps predictions in a `PredictResponse`. Each prediction object has this shape:
+
+```json
+{
+  "predicted_class": "shirts",
+  "confidence": 0.9821,
+  "all_probabilities": {
+    "casual shoes": 0.0031,
+    "handbags": 0.0048,
+    "shirts": 0.9821,
+    "tops": 0.0074,
+    "watches": 0.0026
+  }
+}
+```
+
+The full response from `POST /predict` also includes the `model_version` field (`"production"` or `"latest"`).
+
+## Training metadata logged to MLflow
+
+When you register a model with `scripts/register_model.py`, the following parameters and metrics are logged to the `refund-classifier` experiment:
+
+| Category | Key | Example value |
+|---|---|---|
+| Parameter | `model_architecture` | `efficientnet_b0` |
+| Parameter | `num_classes` | `5` |
+| Parameter | `img_size` | `224` |
+| Parameter | `batch_size` | `32` |
+| Parameter | `num_epochs` | `20` |
+| Parameter | `learning_rate` | `0.001` |
+| Metric | `best_val_acc` | `0.9701` |
+| Metric | `test_acc` | `0.9653` |
+
+Per-epoch train loss, validation loss, train accuracy, and validation accuracy are also logged as step metrics so you can inspect the learning curves in the MLflow UI.
+
+## MLflow pyfunc model interface
+
+The model is wrapped in a `RefundClassifier` class that implements the `mlflow.pyfunc.PythonModel` interface. This is what gets serialized and stored in the MLflow registry.
+
+```python
+class RefundClassifier(mlflow.pyfunc.PythonModel):
+    def load_context(self, context):
+        # Called once when the model is loaded.
+        # Builds the timm model, loads weights, sets up the transform.
+        ...
+
+    def predict(self, context, model_input):
+        # model_input is a dict with key "image_paths": list[str]
+        # Returns a list of prediction dicts.
+        ...
+```
+
+The `mlflow.pyfunc` interface gives you a consistent `model.predict(input)` call regardless of the underlying framework. The Model Service calls it directly:
+
+```python
+predictions = model.predict({"image_paths": request.image_paths})
+```
+
+## Model versioning and promotion
+
+MLflow tracks every registered model version by number. You promote a version to production by setting the `@production` alias:
+
+```python
+import mlflow
+
+mlflow.set_tracking_uri("http://localhost:5000")
+client = mlflow.MlflowClient()
+
+# Promote version 2 to production
+client.set_registered_model_alias("refund-classifier", "production", "2")
+```
+
+The Model Service always loads `models:/refund-classifier@production` on startup. Reassigning the alias is the only change needed to switch which model version is served.
+
+<Info>
+You can also use the `scripts/set_production.py` script to set the alias after registering a new version.
+</Info>
+
+## Rollback procedure
+
+To roll back to a previous model version:
+
+<Steps>
+  <Step title="Reassign the alias">
+    Set `@production` back to the version number you want to restore:
+
+    ```python
+    client.set_registered_model_alias("refund-classifier", "production", "1")
+    ```
+  </Step>
+  <Step title="Restart the Model Service">
+    The service loads the model once at startup. Restart it to pick up the alias change:
+
+    ```bash
+    docker compose restart model-service
+    ```
+  </Step>
+  <Step title="Verify">
+    Check the health endpoint to confirm the correct version is loaded:
+
+    ```bash
+    curl http://localhost:8000/health
+    ```
+
+    The response includes `"model_version": "production"`.
+  </Step>
+</Steps>
+
+<Warning>
+No code changes are required to roll back. Do not modify `app.py` or any environment variable — only the alias assignment and a service restart are needed.
+</Warning>

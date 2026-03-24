@@ -1,0 +1,150 @@
+---
+title: Streamlit UI
+description: Use the Streamlit web interface to upload images, run classification, and browse past batch results.
+---
+
+The Streamlit UI provides a browser-based interface for classifying returned items and reviewing results history. It runs on your host machine (not in Docker) and communicates with the model service over `localhost:8000`.
+
+## Prerequisites
+
+The model service must be running and healthy before you open the UI:
+
+```bash
+curl http://localhost:8000/health
+# {"status":"healthy","model_loaded":true,"model_version":"production"}
+```
+
+If the model service is not running, start it:
+
+```bash
+docker compose up -d
+```
+
+## Starting the UI
+
+```bash
+streamlit run streamlit-ui/app.py
+```
+
+Streamlit starts on port 8501. Open http://localhost:8501 in your browser.
+
+<Note>
+  Run this command from the project root directory (`autorma/`). The UI uses relative paths to read and write `data/inference/` directories, so the working directory must be the project root.
+</Note>
+
+## Interface overview
+
+### Sidebar
+
+The sidebar shows system status on every page:
+
+- **Model Service: Online / Offline** — polls `GET /health` on load
+- **Model Version** — displays the alias loaded by the model service (e.g., `production`)
+- **Total Processed** — reads the checkpoint file and shows the cumulative image count
+- **Last run** — timestamp of the most recent batch run
+
+### Tab 1 — Upload & Classify
+
+Use this tab to classify a new set of images.
+
+<Steps>
+
+<Step title="Upload images">
+
+Click **Browse files** or drag images into the file uploader. The uploader accepts `.jpg`, `.jpeg`, and `.png` files. You can select multiple files at once.
+
+A preview grid shows the first 10 uploaded images (5 per row). If you upload more than 10, a note displays the remaining count.
+
+</Step>
+
+<Step title="Run classification">
+
+Click **Run Classification**. The UI:
+
+1. Saves all uploaded images to `data/inference/input/`
+2. Runs `orchestrator/batch_inference.py` as a subprocess
+3. Waits for the process to complete (timeout: 5 minutes)
+4. Loads the latest result file from `data/inference/output/`
+
+While processing, a spinner displays. On completion, the UI shows:
+
+- **Images Processed** — count of successfully classified images
+- **Duration** — total elapsed time in seconds
+- A results table with columns: `image_name`, `predicted_class`, `confidence`
+
+</Step>
+
+<Step title="Download results">
+
+Click **Download Results (CSV)** to save the results table as a CSV file named `results_<timestamp>.csv`.
+
+</Step>
+
+</Steps>
+
+### Tab 2 — Results history
+
+Browse all previous batch runs stored in `data/inference/output/`.
+
+Select a run from the dropdown (runs are listed by timestamp, most recent first). The UI displays:
+
+| Section | Content |
+|---|---|
+| Summary metrics | Total images, successful, failed, duration |
+| Class distribution | Bar chart of predicted class counts |
+| Detailed results | Table with `image_name`, `predicted_class`, `confidence`, `processed_at` |
+| Failed images | Table of images that caused errors (if any) |
+
+### Tab 3 — About
+
+System information and performance metrics:
+
+- **Model:** EfficientNet-B0, 96.53% test accuracy, ~12 minutes training time
+- **Processing speed:** ~5 seconds per batch of 10 images
+- **Categories:** Casual Shoes, Handbags, Shirts, Tops, Watches
+- **Architecture overview:** Model Service, Batch Orchestrator, MLflow, Prometheus + Grafana
+
+## Troubleshooting
+
+<AccordionGroup>
+
+<Accordion title="Sidebar shows 'Model Service: Offline'">
+
+The UI cannot reach `http://localhost:8000/health`.
+
+1. Check the model service is running: `docker compose ps`
+2. If it is not running: `docker compose up -d`
+3. If it is running but unhealthy, check logs: `docker logs model-service`
+4. Verify the model is registered: `curl http://localhost:5000` and navigate to **Models**
+
+</Accordion>
+
+<Accordion title="Classification fails with a processing error">
+
+The orchestrator subprocess failed. Common causes:
+
+- The model service went offline during processing
+- `data/inference/input/` does not exist — run `mkdir -p data/inference/{input,output,checkpoints}`
+- The UI was launched from the wrong directory — always run `streamlit run streamlit-ui/app.py` from the project root
+
+Check the orchestrator log for details:
+
+```bash
+cat logs/orchestrator.log
+```
+
+</Accordion>
+
+<Accordion title="Results history is empty">
+
+No batch runs have completed yet, or `data/inference/output/` does not contain any `predictions_*.json` files.
+
+Run a classification from Tab 1 first, or manually run the orchestrator:
+
+```bash
+docker compose --profile manual up orchestrator
+```
+
+</Accordion>
+
+</AccordionGroup>

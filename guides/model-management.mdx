@@ -1,0 +1,162 @@
+---
+title: Model management
+description: Register new model versions, promote them to production, roll back to previous versions, and verify what the model service is currently running.
+---
+
+Autorma uses MLflow's model registry to version, alias, and serve models. The model service always loads the version tagged with the `@production` alias. This lets you update or roll back the serving model without changing any service configuration.
+
+## How versioning works
+
+Each time you run `scripts/register_model.py`, MLflow creates a new version number in the `refund-classifier` registered model. Version numbers increment automatically: first registration creates version 1, second creates version 2, and so on.
+
+Aliases decouple the version number from what the model service loads. The model service uses the URI `models:/refund-classifier@production`, so it loads whatever version is currently tagged `production` — regardless of the version number.
+
+You can also use the `@latest` alias, which always points to the highest version number. The model service falls back to `@latest` if `@production` is not set.
+
+## Registering a new model version
+
+Use this workflow after training a new model checkpoint.
+
+<Steps>
+
+<Step title="Place the new checkpoint in models/">
+
+Copy your new `best_model.pth` and `training_metadata.json` into the models directory. You can version the directory (e.g., `models/v2/`) and update the path in `scripts/register_model.py`:
+
+```python
+MODEL_PATH = Path("models/v2/best_model.pth")
+METADATA_PATH = Path("models/v2/training_metadata.json")
+```
+
+</Step>
+
+<Step title="Register the new version">
+
+```bash
+MLFLOW_TRACKING_URI=http://localhost:5000 python scripts/register_model.py
+```
+
+MLflow automatically assigns the next version number. The output shows the new run ID and model URI.
+
+</Step>
+
+<Step title="Promote to production">
+
+`scripts/set_production.py` hardcodes version `"1"`. Before running it for a new version, update the version number:
+
+```python
+client.set_registered_model_alias(
+    name="refund-classifier",
+    alias="production",
+    version="2"  # update to your new version number
+)
+```
+
+Then run:
+
+```bash
+MLFLOW_TRACKING_URI=http://localhost:5000 python scripts/set_production.py
+```
+
+</Step>
+
+<Step title="Restart the model service">
+
+```bash
+docker compose restart model-service
+```
+
+The model service loads the model at startup. Restarting it causes it to fetch the version now tagged `@production`.
+
+</Step>
+
+<Step title="Verify the new version is loaded">
+
+```bash
+curl http://localhost:8000/health
+```
+
+The `model_version` field confirms what alias the service loaded.
+
+</Step>
+
+</Steps>
+
+## Rolling back to a previous version
+
+To revert to a previous model version without re-registering anything, reassign the `@production` alias using the MLflow Python client:
+
+```python
+import mlflow
+
+mlflow.set_tracking_uri("http://localhost:5000")
+client = mlflow.MlflowClient()
+
+# Set version 1 as production again
+client.set_registered_model_alias("refund-classifier", "production", "1")
+```
+
+Then restart the model service to load the rolled-back version:
+
+```bash
+docker compose restart model-service
+```
+
+Verify:
+
+```bash
+curl http://localhost:8000/health
+# {"status":"healthy","model_loaded":true,"model_version":"production"}
+```
+
+<Tip>
+  Roll back is instantaneous — you are only updating an alias pointer in the MLflow database. No files are moved or overwritten.
+</Tip>
+
+## Viewing all versions in the MLflow UI
+
+Open http://localhost:5000 and navigate to **Models → refund-classifier**. You will see:
+
+- All registered versions with their version numbers
+- Which version has the `production` alias
+- Which version has the `latest` alias
+- Links to the experiment runs that produced each version
+
+Click a version to see its logged parameters, metrics, and artifacts, including the full epoch-by-epoch training history.
+
+## Viewing experiment metrics
+
+The registration script logs all runs under the **refund-classifier** experiment. Navigate to **Experiments → refund-classifier** to compare runs. Key metrics available for comparison:
+
+| Metric | Description |
+|---|---|
+| `best_val_acc` | Best validation accuracy across all epochs |
+| `test_acc` | Test set accuracy |
+| `final_train_acc` | Training accuracy at final epoch |
+| `final_val_acc` | Validation accuracy at final epoch |
+| `epoch_val_acc` | Per-epoch validation accuracy (plotted as a curve) |
+
+## Why you cannot fix artifact paths by editing the database
+
+MLflow records the full artifact URI at the moment `mlflow.pyfunc.log_model()` is called. This URI is either:
+
+- An absolute host filesystem path (if logged against a local MLflow server)
+- An `mlflow-artifacts:/` proxy URI (if logged against the Docker MLflow server with `--serve-artifacts`)
+
+You cannot change a recorded artifact URI after the fact. If the model service fails with a path error, the only fix is to delete the registered model and experiment run from the MLflow UI and re-register using `MLFLOW_TRACKING_URI=http://localhost:5000`.
+
+See [Model registration](/guides/model-registration) for the full explanation of why Docker MLflow must be running during registration.
+
+## When to re-register
+
+You need to re-register the model if:
+
+- You deleted or recreated `mlflow_data/` (this wipes the SQLite database and all registered models)
+- You trained a new model and want to deploy it
+- The model service is failing with an artifact path error (re-register after fixing the root cause)
+
+You do **not** need to re-register if:
+
+- The model service restarts normally
+- You roll back to a previous version using alias reassignment
+- You restart Docker services

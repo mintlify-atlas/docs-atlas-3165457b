@@ -1,0 +1,261 @@
+---
+title: Configuration reference
+description: All environment variables, Docker Compose settings, volume mounts, and directory structure for Autorma.
+---
+
+This page documents every configuration option across the model service, orchestrator, Docker Compose services, and monitoring stack.
+
+## Model service
+
+The model service reads configuration from environment variables (or an `.env` file in the working directory) using [pydantic-settings](https://docs.pydantic.dev/latest/concepts/pydantic_settings/).
+
+| Variable | Type | Default | Required | Description |
+|---|---|---|---|---|
+| `MLFLOW_TRACKING_URI` | `str` | — | Yes | URI of the MLflow tracking server. At runtime in Docker, set to `http://mlflow:5000`. On the host for registration scripts, use `http://localhost:5000`. |
+| `MODEL_SERVICE_URL` | `str` | — | Yes | URL of this service itself. Used when the orchestrator and model service share a config source. Typically `http://localhost:8000` locally or `http://model-service:8000` inside Docker. |
+
+<Warning>
+Always set `MLFLOW_TRACKING_URI` to the **Dockerised** MLflow instance (`http://localhost:5000`) when running model registration scripts. Registering against a local MLflow process records host-absolute artifact paths that containers cannot resolve. See the [troubleshooting guide](/reference/troubleshooting) for the full explanation.
+</Warning>
+
+### Model loading behaviour
+
+On startup, the model service sets the tracking URI from `MLFLOW_TRACKING_URI` and attempts to load the model in this order:
+
+1. `models:/refund-classifier@production` — the aliased production version
+2. `models:/refund-classifier@latest` — fallback if the `production` alias is not set
+
+If neither alias resolves, the service fails to start and logs the error.
+
+---
+
+## Orchestrator
+
+The orchestrator reads configuration from environment variables (or an `.env` file) using pydantic-settings.
+
+| Variable | Type | Default | Description |
+|---|---|---|---|
+| `MODEL_SERVICE_URL` | `str` | `http://localhost:8000` | Base URL of the model service. Set to `http://model-service:8000` when running inside Docker. |
+| `BATCH_SIZE` | `int` | `10` | Number of images sent to the model service in each `/predict` request. |
+
+<Tip>
+To run larger batches without changing the default, set `BATCH_SIZE` in the environment before starting the orchestrator container:
+
+```bash
+BATCH_SIZE=25 docker compose --profile manual up orchestrator
+```
+</Tip>
+
+---
+
+## Docker Compose services
+
+The core stack is defined in `docker-compose.yml` at the project root.
+
+### `mlflow` service
+
+```yaml
+mlflow:
+  container_name: mlflow-server
+  ports:
+    - "5000:5000"
+  environment:
+    - MLFLOW_SERVER_ALLOWED_HOSTS=mlflow,mlflow:5000,localhost,localhost:5000,127.0.0.1,127.0.0.1:5000
+  volumes:
+    - ./mlflow_data:/mlflow_data
+  networks:
+    - ml-network
+```
+
+| Setting | Value | Description |
+|---|---|---|
+| Port | `5000:5000` | Exposes the MLflow UI and API on the host at `http://localhost:5000`. |
+| `MLFLOW_SERVER_ALLOWED_HOSTS` | Comma-separated list | Restricts which host headers MLflow accepts. Includes Docker service names and `localhost` variants. |
+| Volume `./mlflow_data:/mlflow_data` | Host → container | Persists the SQLite database (`mlflow.db`) and artifact files across container restarts. |
+| Network | `ml-network` | Shared bridge network enabling service discovery with `model-service`. |
+
+**Health check:**
+
+```yaml
+healthcheck:
+  test: ["CMD", "curl", "-f", "http://localhost:5000"]
+  interval: 30s
+  timeout: 10s
+  retries: 3
+```
+
+The `model-service` waits for this health check to pass before starting (`condition: service_healthy`).
+
+---
+
+### `model-service` service
+
+```yaml
+model-service:
+  container_name: model-service
+  ports:
+    - "8000:8000"
+  environment:
+    - MLFLOW_TRACKING_URI=http://mlflow:5000
+  depends_on:
+    mlflow:
+      condition: service_healthy
+  volumes:
+    - ./data:/data
+  networks:
+    - ml-network
+```
+
+| Setting | Value | Description |
+|---|---|---|
+| Port | `8000:8000` | Exposes the FastAPI inference API on the host at `http://localhost:8000`. |
+| `MLFLOW_TRACKING_URI` | `http://mlflow:5000` | Routes artifact downloads through the MLflow HTTP proxy rather than reading the filesystem directly. |
+| Volume `./data:/data` | Host → container | Mounts the project `data/` directory so the model service can read input images at `/data/inference/input/`. |
+| Network | `ml-network` | Shared bridge network; allows the model service to reach `mlflow` by hostname. |
+
+**Health check:**
+
+```yaml
+healthcheck:
+  test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+  interval: 30s
+  timeout: 10s
+  retries: 3
+```
+
+The `orchestrator` waits for this health check to pass before starting.
+
+---
+
+### `orchestrator` service
+
+```yaml
+orchestrator:
+  container_name: batch-orchestrator
+  environment:
+    - MODEL_SERVICE_URL=http://model-service:8000
+  depends_on:
+    model-service:
+      condition: service_healthy
+  volumes:
+    - ./data/inference:/data/inference
+    - ./logs:/app/logs
+  networks:
+    - ml-network
+  profiles:
+    - manual
+```
+
+| Setting | Value | Description |
+|---|---|---|
+| `MODEL_SERVICE_URL` | `http://model-service:8000` | Points at the model service by its Docker hostname. |
+| Volume `./data/inference:/data/inference` | Host → container | Mounts input images, output results, and checkpoints into the container. |
+| Volume `./logs:/app/logs` | Host → container | Persists orchestrator logs on the host. |
+| `profiles: [manual]` | `manual` | The orchestrator only starts when you explicitly pass `--profile manual`. It runs once and exits. |
+
+<Note>
+The orchestrator has no exposed ports. It communicates outbound to the model service over `ml-network` and writes results to the shared volume.
+</Note>
+
+---
+
+## Monitoring stack
+
+The monitoring services are defined separately in `monitoring/docker-compose.yml`.
+
+### Prometheus
+
+```yaml
+prometheus:
+  image: prom/prometheus:latest
+  container_name: prometheus
+  ports:
+    - "9090:9090"
+  volumes:
+    - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    - prometheus-data:/prometheus
+  command:
+    - '--config.file=/etc/prometheus/prometheus.yml'
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+```
+
+The `host.docker.internal:host-gateway` entry allows Prometheus to reach services on the host network (such as the model service running on a different Docker network). On WSL, use the WSL IP address in `prometheus.yml` instead of `host.docker.internal`.
+
+### `prometheus.yml` scrape configuration
+
+```yaml
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: 'model_service'
+    static_configs:
+      - targets: ['<host-ip>:8000']
+    metrics_path: '/metrics'
+
+  - job_name: 'pushgateway'
+    static_configs:
+      - targets: ['pushgateway:9091']
+```
+
+| Setting | Value | Description |
+|---|---|---|
+| `scrape_interval` | `15s` | Global default scrape interval. All targets inherit this unless overridden. |
+| `model_service` target | `<host-ip>:8000` | The model service `/metrics` endpoint. Replace `<host-ip>` with your host IP or `host.docker.internal`. |
+| `pushgateway` target | `pushgateway:9091` | Prometheus Pushgateway, reachable by hostname within the monitoring network. |
+
+<Warning>
+Prometheus runs in its own Docker network and cannot reach `localhost` or `model-service` on `ml-network` directly. Set the `model_service` target to `host.docker.internal:8000` (macOS/Windows) or your WSL IP (Linux/WSL).
+</Warning>
+
+### Pushgateway
+
+```yaml
+pushgateway:
+  image: prom/pushgateway:latest
+  container_name: pushgateway
+  ports:
+    - "9091:9091"
+```
+
+No additional configuration required. The orchestrator pushes batch metrics to `http://localhost:9091` by default.
+
+### Grafana
+
+```yaml
+grafana:
+  image: grafana/grafana:latest
+  container_name: grafana
+  ports:
+    - "3000:3000"
+  environment:
+    - GF_SECURITY_ADMIN_PASSWORD=admin
+  volumes:
+    - grafana-data:/var/lib/grafana
+```
+
+| Setting | Value | Description |
+|---|---|---|
+| `GF_SECURITY_ADMIN_PASSWORD` | `admin` | Default admin password. Change this before exposing Grafana publicly. |
+| Port | `3000:3000` | Grafana UI accessible at `http://localhost:3000`. |
+| Volume `grafana-data` | Named volume | Persists dashboards, data sources, and settings across restarts. |
+
+---
+
+## Directory structure
+
+The following directories must exist before starting the system. Create them with:
+
+```bash
+mkdir -p data/inference/{input,output,checkpoints} mlflow_data/artifacts logs
+```
+
+| Path | Description |
+|---|---|
+| `data/inference/input/` | Place `.jpg` or `.png` images here before running the orchestrator. The orchestrator scans this directory for unprocessed images. |
+| `data/inference/output/` | The orchestrator writes prediction results here as `predictions_<timestamp>.json`. |
+| `data/inference/checkpoints/` | Stores `checkpoint.json`, which tracks already-processed image paths. Delete this file to force a full rerun. |
+| `mlflow_data/mlflow.db` | SQLite database backing the MLflow tracking server. Created automatically on first run. |
+| `mlflow_data/artifacts/` | Stores model artifacts (weights, metadata) proxied by the MLflow server. Must exist before starting `docker compose up`. |
+| `logs/` | Orchestrator logs. Mounted into the container at `/app/logs`. |

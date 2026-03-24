@@ -1,0 +1,77 @@
+---
+title: GET /health
+description: Liveness check that returns the model's load status and which MLflow alias was resolved at startup.
+---
+
+Returns a JSON object indicating whether the service is running and whether the model is ready to serve predictions. Use this endpoint for Docker health checks, orchestrator pre-flight checks, and uptime monitoring.
+
+## Request
+
+```
+GET /health
+```
+
+No parameters, headers, or request body required.
+
+```bash
+curl http://localhost:8000/health
+```
+
+## Response
+
+```json
+{
+  "status": "healthy",
+  "model_loaded": true,
+  "model_version": "production"
+}
+```
+
+<ResponseField name="status" type="string" required>
+  Always `"healthy"` if the HTTP server is running. This field does not reflect whether the model is loaded — check `model_loaded` for that.
+</ResponseField>
+
+<ResponseField name="model_loaded" type="boolean" required>
+  `true` if the model was loaded successfully at startup and is ready to serve predictions. `false` if the service is still initialising or if model loading failed.
+</ResponseField>
+
+<ResponseField name="model_version" type="string" required>
+  The MLflow alias that was resolved at startup: `"production"` if the `@production` alias existed, or `"latest"` if the service fell back to `@latest`. Returns `null` if the model has not loaded yet.
+</ResponseField>
+
+## Prometheus metric
+
+Every call to `/health` increments:
+
+```
+api_requests_total{endpoint="/health", status="success"}
+```
+
+## Use cases
+
+**Docker health check** — add the following to your `docker-compose.yml` service definition:
+
+```yaml
+healthcheck:
+  test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+  interval: 30s
+  timeout: 5s
+  retries: 3
+```
+
+**Orchestrator pre-flight** — the batch orchestrator calls `/health` before starting a run. If the request fails or `model_loaded` is `false`, the orchestrator logs an error and exits rather than sending images to an unavailable service.
+
+**Monitoring** — configure your uptime monitor to alert if the endpoint returns a non-200 status code or if `model_loaded` is `false`.
+
+## If `model_loaded` is false
+
+<Warning>
+  A `false` value for `model_loaded` means the model service cannot classify images. Calls to `POST /predict` will return `503 Service Unavailable`.
+</Warning>
+
+To diagnose the issue:
+
+1. Check the container logs: `docker compose logs model-service`
+2. Confirm the MLflow server is running and reachable at the configured `MLFLOW_TRACKING_URI`
+3. Confirm that a version of `refund-classifier` exists in the MLflow model registry with either the `@production` or `@latest` alias set
+4. Restart the model service after fixing the underlying issue: `docker compose restart model-service`

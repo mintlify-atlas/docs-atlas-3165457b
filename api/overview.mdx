@@ -1,0 +1,95 @@
+---
+title: API overview
+description: The Autorma model service exposes three HTTP endpoints for inference, health checking, and metrics scraping.
+---
+
+The model service is a FastAPI application running on port `8000`. It loads the `refund-classifier` model from MLflow at startup and serves it for the lifetime of the container. All communication is over plain HTTP — no authentication is required because the service runs on an internal Docker network (`ml-network`) and is not exposed to the public internet.
+
+## Base URL
+
+```
+http://localhost:8000
+```
+
+When calling from another container on `ml-network`, use the service hostname instead:
+
+```
+http://model-service:8000
+```
+
+## Endpoints
+
+<Columns cols={3}>
+  <Card title="GET /health" icon="heart-pulse" href="/api/health">
+    Liveness check. Returns model status and which alias was loaded.
+  </Card>
+  <Card title="POST /predict" icon="brain" href="/api/predict">
+    Classify one or more images by file path. Returns predicted class, confidence, and per-class probabilities.
+  </Card>
+  <Card title="GET /metrics" icon="chart-line" href="/api/metrics">
+    Prometheus scrape endpoint. Returns all metrics in text exposition format.
+  </Card>
+</Columns>
+
+## Authentication
+
+None. The model service is an internal component protected by network isolation only. Do not expose port `8000` to the public internet.
+
+## Content-Type
+
+`POST /predict` accepts and returns `application/json`. `GET /metrics` returns `text/plain; version=0.0.4` (Prometheus exposition format). `GET /health` returns `application/json`.
+
+## Startup and model loading
+
+When the container starts, the service runs the following sequence:
+
+<Steps>
+  <Step title="Connect to MLflow">
+    Sets `MLFLOW_TRACKING_URI` from the `MLFLOW_TRACKING_URI` environment variable (default: `http://mlflow:5000`).
+  </Step>
+  <Step title="Load production model">
+    Requests `models:/refund-classifier@production` from the MLflow model registry. MLflow resolves the alias to a version number, then streams the artifact files back over HTTP via its artifact proxy.
+  </Step>
+  <Step title="Fall back to latest">
+    If the `@production` alias does not exist — for example during initial setup before a model has been promoted — the service falls back to `models:/refund-classifier@latest` and logs a warning.
+  </Step>
+  <Step title="Accept requests">
+    Once the model is loaded into memory, the service begins accepting requests. The `model_loaded` Prometheus gauge is set to `1`.
+  </Step>
+</Steps>
+
+<Note>
+  The service does not hot-reload models. To load a new model version, restart the container after promoting the new version to the `@production` alias in MLflow.
+</Note>
+
+## Error responses
+
+| Status | When |
+|--------|------|
+| `400 Bad Request` | An image path in the request does not exist on the filesystem. |
+| `500 Internal Server Error` | An unexpected error occurred during inference. |
+| `503 Service Unavailable` | The model has not finished loading. Retry after a short delay. |
+
+All error responses have the shape:
+
+```json
+{
+  "detail": "<error message>"
+}
+```
+
+## Quick start
+
+Check that the service is healthy:
+
+```bash
+curl http://localhost:8000/health
+```
+
+Classify an image:
+
+```bash
+curl -X POST http://localhost:8000/predict \
+  -H "Content-Type: application/json" \
+  -d '{"image_paths": ["/data/inference/input/item1.jpg"]}'
+```

@@ -1,0 +1,78 @@
+---
+title: "Introduction"
+description: "An end-to-end MLOps system for automated classification of returned e-commerce items using computer vision."
+---
+
+## What is Autorma?
+
+Autorma is a production-grade machine learning system that automatically classifies returned e-commerce items into five categories — **Casual Shoes**, **Handbags**, **Shirts**, **Tops**, and **Watches** — using computer vision.
+
+Built on a fine-tuned EfficientNet-B0 model with **96.53% test accuracy**, Autorma provides a complete MLOps pipeline: from model versioning and batch inference to real-time monitoring and a user-friendly interface.
+
+<CardGroup cols={2}>
+  <Card title="Quick Start" icon="rocket" href="/quickstart">
+    Get the system running in minutes with Docker Compose
+  </Card>
+  <Card title="Architecture" icon="diagram-project" href="/concepts/architecture">
+    Understand the microservices design and data flow
+  </Card>
+  <Card title="API Reference" icon="code" href="/api/overview">
+    Integrate with the FastAPI inference service
+  </Card>
+  <Card title="Batch Inference" icon="layer-group" href="/guides/batch-inference">
+    Run scheduled or on-demand batch classification jobs
+  </Card>
+</CardGroup>
+
+## Key capabilities
+
+<CardGroup cols={2}>
+  <Card title="96.53% accuracy" icon="bullseye">
+    EfficientNet-B0 fine-tuned on 5 return item categories with production-grade performance
+  </Card>
+  <Card title="Batch processing" icon="gears">
+    Idempotent batch orchestrator with checkpoint-based crash recovery and cron scheduling
+  </Card>
+  <Card title="MLflow model registry" icon="code-branch">
+    Alias-based model promotion with zero-downtime rollback across container boundaries
+  </Card>
+  <Card title="Full observability" icon="chart-line">
+    Prometheus metrics, Grafana dashboards, and per-class prediction tracking
+  </Card>
+  <Card title="Containerised services" icon="docker">
+    Docker Compose stack with health checks and artifact proxy for reliable deployments
+  </Card>
+  <Card title="Streamlit UI" icon="display">
+    Upload images, trigger batch jobs, and review classification history in a browser
+  </Card>
+</CardGroup>
+
+## System services
+
+| Service | Purpose | Port |
+|---|---|---|
+| MLflow | Model registry & experiment tracking | 5000 |
+| Model Service | FastAPI inference API | 8000 |
+| Orchestrator | Batch inference runner | — |
+| Prometheus | Metrics collection | 9090 |
+| Pushgateway | Batch metrics ingestion | 9091 |
+| Grafana | Dashboards | 3000 |
+| Streamlit UI | Manual batch interface | 8501 |
+
+## Classification categories
+
+Autorma classifies returned items into five categories:
+
+- **Casual Shoes** — sports and casual footwear
+- **Handbags** — purses, totes, and shoulder bags
+- **Shirts** — button-up and formal shirts
+- **Tops** — t-shirts, blouses, and casual tops
+- **Watches** — wristwatches and timepieces
+
+## Tech stack
+
+**Python · PyTorch · FastAPI · MLflow · Docker · Prometheus · Grafana · Streamlit**
+
+<Note>
+Autorma was built as a final year project demonstrating end-to-end ML systems engineering, but is designed with production-grade practices throughout.
+</Note>

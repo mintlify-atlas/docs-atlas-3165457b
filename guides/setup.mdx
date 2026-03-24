@@ -1,0 +1,216 @@
+---
+title: Setup
+description: Install and configure Autorma from a fresh clone, including asset downloads, directory creation, and service startup.
+---
+
+This guide walks you through everything you need to get Autorma running locally. Total setup time is roughly 30 minutes, most of which is downloading assets and building Docker images.
+
+## System requirements
+
+| Requirement | Minimum version |
+|---|---|
+| Docker | 24+ |
+| Docker Compose | v2 (bundled with Docker Desktop) |
+| Python | 3.12+ |
+| [uv](https://docs.astral.sh/uv/) | latest |
+| RAM | 8 GB |
+
+## Directory structure
+
+After cloning, the repository contains source code and configuration. The large binary assets (dataset, model weights, runtime data) are **not** in Git and must be created or downloaded separately.
+
+```
+autorma/
+├── model_service/          # FastAPI inference server
+├── orchestrator/           # Batch inference runner
+├── streamlit-ui/           # Streamlit web interface
+├── scripts/                # Model registration scripts
+├── monitoring/             # Prometheus + Grafana stack
+├── notebooks/              # Training notebooks
+├── docker-compose.yml
+├── mlflow.Dockerfile
+├── model_service.Dockerfile
+├── orchestrator.Dockerfile
+└── pyproject.toml
+```
+
+The following directories are excluded from Git and must be created before starting:
+
+| Directory | Purpose |
+|---|---|
+| `data/inference/input/` | Images queued for batch processing |
+| `data/inference/output/` | Batch result JSON files |
+| `data/inference/checkpoints/` | Idempotency checkpoint |
+| `mlflow_data/artifacts/` | MLflow artifact store |
+| `logs/` | Orchestrator and service logs |
+| `models/v1/` | Downloaded model checkpoint |
+| `data/processed/` | Downloaded training dataset |
+
+<Steps>
+
+<Step title="Clone the repository">
+
+```bash
+git clone https://github.com/DanielPopoola/autorma.git
+cd autorma
+```
+
+</Step>
+
+<Step title="Install Python dependencies">
+
+```bash
+uv sync
+```
+
+This creates a virtual environment and installs all packages from `pyproject.toml`.
+
+</Step>
+
+<Step title="Download required assets">
+
+Two large files are hosted on Google Drive and must be downloaded before the system will run.
+
+| Asset | Size | Destination | Link |
+|---|---|---|---|
+| Training dataset | ~750 MB | `data/processed/` | [Google Drive](https://drive.google.com/drive/folders/1g1V4I3WL8FfXLZfkXqrTYcCR8etojiBY?usp=drive_link) |
+| Trained model v1 | ~50 MB | `models/v1/` | [Google Drive](https://drive.google.com/drive/folders/1IQ4wyuTYO0TuQvKg0bIZ3n1kTZQpuvtp?usp=drive_link) |
+
+After downloading, extract each archive:
+
+```bash
+unzip dataset.zip -d data/
+unzip model_v1.zip -d models/
+```
+
+Verify the model files are in place:
+
+```bash
+ls -lh models/v1/
+# best_model.pth           (~20 MB)
+# training_metadata.json   (~5 KB)
+```
+
+<Tip>
+  If you can't access the Google Drive links, you can recreate the dataset from the [Fashion Product Images dataset on Kaggle](https://www.kaggle.com/datasets/paramaggarwal/fashion-product-images-dataset) using `notebooks/01_data_preparation.ipynb`, and retrain the model using `notebooks/02_model_training.ipynb`.
+</Tip>
+
+</Step>
+
+<Step title="Create required directories">
+
+```bash
+mkdir -p data/inference/{input,output,checkpoints} mlflow_data/artifacts logs
+```
+
+</Step>
+
+<Step title="Start core services">
+
+MLflow and the model service both run in Docker. Build and start them together:
+
+```bash
+docker compose up --build -d
+```
+
+The first build takes roughly 60 seconds because it installs PyTorch. Wait for both services to become healthy:
+
+```bash
+docker compose ps
+# Both mlflow-server and model-service should show "healthy"
+```
+
+</Step>
+
+<Step title="Register the model">
+
+The model service loads its weights from MLflow at startup. You need to register the model weights before it can serve predictions.
+
+<Warning>
+  Run these commands while Docker is running. Registering against a locally-started MLflow instance records host-absolute artifact paths that containers cannot resolve. See [Model registration](/guides/model-registration) for the full explanation.
+</Warning>
+
+```bash
+MLFLOW_TRACKING_URI=http://localhost:5000 python scripts/register_model.py
+MLFLOW_TRACKING_URI=http://localhost:5000 python scripts/set_production.py
+```
+
+Then restart the model service to load the newly registered model:
+
+```bash
+docker compose restart model-service
+```
+
+Verify the model loaded:
+
+```bash
+curl http://localhost:8000/health
+# {"status":"healthy","model_loaded":true,"model_version":"production"}
+```
+
+</Step>
+
+</Steps>
+
+## Service overview
+
+The `docker-compose.yml` defines three services on a shared `ml-network` bridge network.
+
+### Port allocation
+
+| Service | Container name | Host port | Purpose |
+|---|---|---|---|
+| MLflow | `mlflow-server` | 5000 | Model registry UI and API |
+| Model service | `model-service` | 8000 | FastAPI inference endpoint |
+| Orchestrator | `batch-orchestrator` | — | One-shot batch runner |
+| Prometheus | `prometheus` | 9090 | Metrics collection |
+| Pushgateway | `pushgateway` | 9091 | Batch metrics ingestion |
+| Grafana | `grafana` | 3000 | Dashboards |
+| Streamlit UI | — (host process) | 8501 | Web interface |
+
+### Volume mounts
+
+| Service | Host path | Container path | Purpose |
+|---|---|---|---|
+| MLflow | `./mlflow_data` | `/mlflow_data` | Artifact store and SQLite database |
+| Model service | `./data` | `/data` | Shared image access for inference |
+| Orchestrator | `./data/inference` | `/data/inference` | Input/output/checkpoint directories |
+| Orchestrator | `./logs` | `/app/logs` | Persistent log files |
+
+### Environment variables
+
+| Variable | Service | Value | Description |
+|---|---|---|---|
+| `MLFLOW_TRACKING_URI` | model-service | `http://mlflow:5000` | Points to the MLflow container |
+| `MODEL_SERVICE_URL` | orchestrator | `http://model-service:8000` | Points to the model service container |
+
+### Network
+
+All three services join `ml-network`, a Docker bridge network. This lets them communicate using container names as hostnames (e.g., `mlflow`, `model-service`) rather than IP addresses. The orchestrator uses the `manual` profile so it only starts when explicitly invoked.
+
+### Health checks
+
+| Service | Endpoint | Interval |
+|---|---|---|
+| MLflow | `http://localhost:5000` | 30s |
+| Model service | `http://localhost:8000/health` | 30s |
+
+The model service `depends_on` MLflow with `condition: service_healthy`, so Docker waits for MLflow to pass its health check before starting the model service.
+
+## Optional components
+
+### Monitoring stack
+
+```bash
+cd monitoring && docker compose up -d
+```
+
+Starts Prometheus, Pushgateway, and Grafana. See [Monitoring](/guides/monitoring) for details.
+
+### Streamlit UI
+
+```bash
+streamlit run streamlit-ui/app.py
+```
+
+Runs on the host (not in Docker) and connects to the model service at `localhost:8000`. See [Streamlit UI](/guides/streamlit-ui) for details.

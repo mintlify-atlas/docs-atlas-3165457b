@@ -1,0 +1,147 @@
+---
+title: Monitoring
+description: Start the Prometheus, Pushgateway, and Grafana monitoring stack and explore the metrics exposed by the model service and batch orchestrator.
+---
+
+Autorma ships a self-contained monitoring stack in `monitoring/`. It runs Prometheus, Pushgateway, and Grafana via Docker Compose, separate from the core services.
+
+## Starting the monitoring stack
+
+```bash
+cd monitoring && docker compose up -d
+```
+
+This starts three containers:
+
+| Service | URL | Credentials |
+|---|---|---|
+| Prometheus | http://localhost:9090 | — |
+| Pushgateway | http://localhost:9091 | — |
+| Grafana | http://localhost:3000 | admin / admin |
+
+## How metrics flow
+
+```
+Model service (/metrics) ──── scrape every 15s ───▶ Prometheus ──▶ Grafana
+Batch orchestrator ──────── push after each run ──▶ Pushgateway ─▶
+```
+
+### Model service metrics (scraped)
+
+Prometheus scrapes the model service at `/metrics` every 15 seconds. The model service exposes six metrics:
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `api_requests_total` | Counter | `endpoint`, `status` | Total HTTP requests by endpoint and outcome |
+| `api_request_duration_seconds` | Histogram | `endpoint` | Request latency distribution |
+| `prediction_confidence` | Histogram | — | Distribution of prediction confidence scores |
+| `predictions_by_class_total` | Counter | `class_name` | Cumulative predictions per category |
+| `model_loaded` | Gauge | — | `1` if model is loaded, `0` if not |
+| `images_processed_total` | Counter | — | Total images classified since startup |
+
+### Batch metrics (pushed)
+
+After every orchestrator run, `MetricsPusher` pushes four metrics to Pushgateway under the job name `batch_orchestrator`:
+
+| Metric | Description |
+|---|---|
+| `batch_duration_seconds` | Total time for the batch run |
+| `batch_images_processed` | Number of images successfully classified |
+| `batch_images_failed` | Number of images that failed |
+| `batch_success_rate` | Fraction of images successfully classified (0–1) |
+
+Per-class counts are also pushed as individual gauges named `predictions_class_<class_name>` (e.g., `predictions_class_Shirts`, `predictions_class_Casual_Shoes`).
+
+## Prometheus configuration
+
+The scrape configuration lives in `monitoring/prometheus.yml`:
+
+```yaml
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: 'model_service'
+    static_configs:
+      - targets: ['172.18.211.68:8000']
+    metrics_path: '/metrics'
+
+  - job_name: 'pushgateway'
+    static_configs:
+      - targets: ['pushgateway:9091']
+```
+
+<Warning>
+  The `model_service` target uses a hardcoded IP address (`172.18.211.68`). This IP is the WSL network interface address from the development machine. On your machine you will need to update it to your own host's IP.
+
+  The monitoring containers run in their own Docker network, separate from `ml-network`. They cannot reach the model service using `localhost` or `model-service` as a hostname. Use your host's IP address, or on Linux use `host.docker.internal` (available because `extra_hosts: host.docker.internal:host-gateway` is set in `monitoring/docker-compose.yml`).
+
+  To find the correct IP on Linux/WSL:
+  ```bash
+  ip addr show eth0 | grep -oP '(?<=inet\s)\d+(\.[\d]+){3}'
+  ```
+</Warning>
+
+The Pushgateway target uses the container hostname `pushgateway:9091` because both services share the same Docker Compose network.
+
+## Grafana setup
+
+Open Grafana at http://localhost:3000 and log in with `admin` / `admin`.
+
+Grafana reads from Prometheus as its data source. You can build dashboards using the metrics listed above. Key panels to create:
+
+| Panel | Query |
+|---|---|
+| Request rate | `rate(api_requests_total[5m])` |
+| P95 latency | `histogram_quantile(0.95, rate(api_request_duration_seconds_bucket[5m]))` |
+| Predictions by class | `predictions_by_class_total` |
+| Confidence distribution | `prediction_confidence_bucket` |
+| Batch success rate | `batch_success_rate` |
+| Batch duration | `batch_duration_seconds` |
+| Total images processed | `images_processed_total` |
+
+## Verifying metrics are flowing
+
+```bash
+# Check Prometheus scrape targets
+curl http://localhost:9090/api/v1/targets
+
+# Query a metric directly
+curl 'http://localhost:9090/api/v1/query?query=images_processed_total'
+
+# Check Pushgateway has received batch metrics
+curl http://localhost:9091/metrics | grep batch_
+```
+
+## Troubleshooting
+
+<AccordionGroup>
+
+<Accordion title="Grafana shows no data">
+
+Grafana dashboards are empty until there is traffic to measure.
+
+1. Run at least one batch job to generate metrics
+2. Make a direct prediction request: `curl -X POST http://localhost:8000/predict -H 'Content-Type: application/json' -d '{"image_paths":["/data/inference/input/image.jpg"]}'`
+3. Expand the time range to **Last 6 hours**
+4. Verify the Prometheus data source is configured under **Connections → Data sources**
+
+</Accordion>
+
+<Accordion title="Prometheus target is DOWN">
+
+1. Open http://localhost:9090/targets and check which target shows DOWN
+2. For the `model_service` target: update the IP in `monitoring/prometheus.yml` to match your host IP, then restart Prometheus: `docker compose restart prometheus`
+3. Confirm the model service is running: `curl http://localhost:8000/health`
+
+</Accordion>
+
+<Accordion title="Pushgateway not receiving batch metrics">
+
+The orchestrator uses `localhost:9091` as the Pushgateway address by default. If the orchestrator runs inside Docker, `localhost` resolves to the container, not the host.
+
+Ensure the Pushgateway URL is reachable from where the orchestrator is running. When running the orchestrator via Docker Compose, the Pushgateway should be reachable at `pushgateway:9091` if both are on the same network, or at `host.docker.internal:9091` otherwise.
+
+</Accordion>
+
+</AccordionGroup>

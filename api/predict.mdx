@@ -1,0 +1,118 @@
+---
+title: POST /predict
+description: Classify one or more images by file path. Returns the predicted category, confidence score, and full probability distribution for each image.
+---
+
+The primary inference endpoint. You send a list of absolute file paths; the model service reads each image from disk, runs it through the EfficientNet-B0 classifier, and returns predictions for all images in a single response.
+
+## Request
+
+```
+POST /predict
+Content-Type: application/json
+```
+
+```bash
+curl -X POST http://localhost:8000/predict \
+  -H "Content-Type: application/json" \
+  -d '{"image_paths": ["/data/inference/input/item1.jpg"]}'
+```
+
+### Request body
+
+<ParamField body="image_paths" type="string[]" required>
+  List of absolute paths to image files. Supported formats: `.jpg`, `.png`. Each path must be accessible from within the model service container — mount the image directory as a shared volume if you are calling from the host or from another container.
+</ParamField>
+
+<Info>
+  The model service reads files from the paths you provide. If you are running the service in Docker, the images must be on a volume that is mounted into the container. The default setup mounts `./data/inference` to `/data/inference` in both the model service and orchestrator containers.
+</Info>
+
+## Response
+
+```json
+{
+  "predictions": [
+    {
+      "predicted_class": "Shirts",
+      "confidence": 0.9834,
+      "all_probabilities": {
+        "Casual Shoes": 0.0021,
+        "Handbags": 0.0043,
+        "Shirts": 0.9834,
+        "Tops": 0.0089,
+        "Watches": 0.0013
+      }
+    }
+  ],
+  "model_version": "production"
+}
+```
+
+<ResponseField name="predictions" type="object[]" required>
+  One prediction object per input image, in the same order as `image_paths`.
+
+  <Expandable title="prediction object properties">
+    <ResponseField name="predicted_class" type="string" required>
+      The category with the highest probability. One of: `"Casual Shoes"`, `"Handbags"`, `"Shirts"`, `"Tops"`, `"Watches"`.
+    </ResponseField>
+
+    <ResponseField name="confidence" type="number" required>
+      The probability score for the predicted class, between `0.0` and `1.0`. A score above `0.9` indicates high confidence.
+    </ResponseField>
+
+    <ResponseField name="all_probabilities" type="object" required>
+      A mapping of every class name to its probability score. All values sum to `1.0`.
+
+      <Expandable title="all_probabilities properties">
+        <ResponseField name="Casual Shoes" type="number">Probability for the Casual Shoes class.</ResponseField>
+        <ResponseField name="Handbags" type="number">Probability for the Handbags class.</ResponseField>
+        <ResponseField name="Shirts" type="number">Probability for the Shirts class.</ResponseField>
+        <ResponseField name="Tops" type="number">Probability for the Tops class.</ResponseField>
+        <ResponseField name="Watches" type="number">Probability for the Watches class.</ResponseField>
+      </Expandable>
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="model_version" type="string" required>
+  The MLflow alias used to load the model: `"production"` or `"latest"`. The same value returned by `GET /health`.
+</ResponseField>
+
+## Error responses
+
+| Status | Cause | Resolution |
+|--------|-------|------------|
+| `400 Bad Request` | One or more paths in `image_paths` do not exist on the filesystem. | Verify the paths are correct and that the file volume is mounted into the container. |
+| `503 Service Unavailable` | The model is not loaded yet. | Wait for the service to finish starting up, or check `GET /health` and the container logs. |
+| `500 Internal Server Error` | An unexpected error occurred during inference. | Check the model service logs: `docker compose logs model-service`. |
+
+## Batch usage
+
+The batch orchestrator (`orchestrator/batch_inference.py`) scans `data/inference/input/` for unprocessed `.jpg` and `.png` files, groups them into batches of `BATCH_SIZE` images each, and sends each batch to `/predict` in a single request:
+
+```python
+response = requests.post(
+    f"{settings.MODEL_SERVICE_URL}/predict",
+    json={"image_paths": [str(p.absolute()) for p in image_paths]},
+    timeout=30,
+)
+```
+
+You can send multiple images per request. There is no hard limit enforced by the API, but keep batch sizes practical — very large batches will increase request latency and memory usage.
+
+<Tip>
+  The orchestrator checkpoints progress after each batch. If a run is interrupted, it resumes from where it left off on the next run, skipping already-processed images.
+</Tip>
+
+## Prometheus metrics
+
+Each successful call to `/predict` records the following metrics:
+
+| Metric | Type | What it tracks |
+|--------|------|----------------|
+| `prediction_confidence` | Histogram | Confidence score for each prediction, bucketed at 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 1.0 |
+| `predictions_by_class_total` | Counter | Number of predictions per class, labelled by `class_name` |
+| `images_processed_total` | Counter | Cumulative count of all images classified |
+| `api_request_duration_seconds` | Histogram | End-to-end request latency for the `/predict` endpoint |
+| `api_requests_total` | Counter | Total requests with `endpoint="/predict"` and `status="success"` or `status="error"` |

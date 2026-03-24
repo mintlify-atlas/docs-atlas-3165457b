@@ -1,0 +1,169 @@
+---
+title: GET /metrics
+description: Prometheus scrape endpoint. Returns all instrumentation metrics in Prometheus text exposition format.
+---
+
+This endpoint is scraped by Prometheus every 15 seconds as part of the monitoring stack. It returns plain text in [Prometheus exposition format](https://prometheus.io/docs/instrumenting/exposition_formats/) — not JSON.
+
+## Request
+
+```
+GET /metrics
+```
+
+No parameters, headers, or request body required.
+
+```bash
+curl http://localhost:8000/metrics
+```
+
+## Response format
+
+- **Content-Type:** `text/plain; version=0.0.4`
+- **Body:** Prometheus text exposition format — one metric family per block, preceded by `# HELP` and `# TYPE` comment lines
+
+## Sample output
+
+```text
+# HELP api_requests_total Total API requests
+# TYPE api_requests_total counter
+api_requests_total{endpoint="/health",status="success"} 42.0
+api_requests_total{endpoint="/predict",status="success"} 317.0
+api_requests_total{endpoint="/predict",status="error"} 3.0
+# HELP api_request_duration_seconds Request duration
+# TYPE api_request_duration_seconds histogram
+api_request_duration_seconds_bucket{endpoint="/predict",le="0.005"} 0.0
+api_request_duration_seconds_bucket{endpoint="/predict",le="0.01"} 2.0
+api_request_duration_seconds_bucket{endpoint="/predict",le="0.025"} 18.0
+api_request_duration_seconds_bucket{endpoint="/predict",le="0.05"} 89.0
+api_request_duration_seconds_bucket{endpoint="/predict",le="0.1"} 241.0
+api_request_duration_seconds_bucket{endpoint="/predict",le="+Inf"} 317.0
+api_request_duration_seconds_sum{endpoint="/predict"} 14.832
+api_request_duration_seconds_count{endpoint="/predict"} 317.0
+# HELP prediction_confidence Prediction confidence scores
+# TYPE prediction_confidence histogram
+prediction_confidence_bucket{le="0.5"} 4.0
+prediction_confidence_bucket{le="0.6"} 9.0
+prediction_confidence_bucket{le="0.7"} 21.0
+prediction_confidence_bucket{le="0.8"} 58.0
+prediction_confidence_bucket{le="0.9"} 187.0
+prediction_confidence_bucket{le="0.95"} 278.0
+prediction_confidence_bucket{le="1.0"} 317.0
+prediction_confidence_bucket{le="+Inf"} 317.0
+prediction_confidence_sum 284.71
+prediction_confidence_count 317.0
+# HELP predictions_by_class_total Predictions by class
+# TYPE predictions_by_class_total counter
+predictions_by_class_total{class_name="Casual Shoes"} 48.0
+predictions_by_class_total{class_name="Handbags"} 61.0
+predictions_by_class_total{class_name="Shirts"} 89.0
+predictions_by_class_total{class_name="Tops"} 74.0
+predictions_by_class_total{class_name="Watches"} 45.0
+# HELP model_loaded Whether model is loaded
+# TYPE model_loaded gauge
+model_loaded 1.0
+# HELP images_processed_total Total images processed
+# TYPE images_processed_total counter
+images_processed_total 317.0
+```
+
+## Metrics reference
+
+<AccordionGroup>
+  <Accordion title="api_requests_total — Counter">
+    Total number of HTTP requests handled by the service.
+
+    **Labels:**
+    - `endpoint` — the request path: `/health` or `/predict`
+    - `status` — `"success"` for 2xx responses, `"error"` for 4xx/5xx responses
+
+    **Example query** — request error rate over the last 5 minutes:
+    ```
+    rate(api_requests_total{status="error"}[5m])
+    ```
+  </Accordion>
+
+  <Accordion title="api_request_duration_seconds — Histogram">
+    End-to-end request duration in seconds, measured from when the handler starts to when the response is returned.
+
+    **Labels:**
+    - `endpoint` — the request path
+
+    **Example query** — 95th percentile latency for `/predict`:
+    ```
+    histogram_quantile(0.95, rate(api_request_duration_seconds_bucket{endpoint="/predict"}[5m]))
+    ```
+  </Accordion>
+
+  <Accordion title="prediction_confidence — Histogram">
+    Confidence score recorded for each individual prediction. Uses custom buckets to give fine-grained visibility in the high-confidence range: `0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 1.0`.
+
+    **No labels.**
+
+    **Example query** — proportion of predictions with confidence above 0.9:
+    ```
+    prediction_confidence_bucket{le="+Inf"} - prediction_confidence_bucket{le="0.9"}
+    ```
+  </Accordion>
+
+  <Accordion title="predictions_by_class_total — Counter">
+    Number of times each class has been predicted. Use this to monitor class distribution and detect drift.
+
+    **Labels:**
+    - `class_name` — one of `Casual Shoes`, `Handbags`, `Shirts`, `Tops`, `Watches`
+
+    **Example query** — predictions per class over the last hour:
+    ```
+    increase(predictions_by_class_total[1h])
+    ```
+  </Accordion>
+
+  <Accordion title="model_loaded — Gauge">
+    `1.0` if the model is loaded and ready to serve predictions, `0.0` otherwise. Set during the startup lifespan event.
+
+    **No labels.**
+
+    **Example alert rule:**
+    ```yaml
+    - alert: ModelNotLoaded
+      expr: model_loaded == 0
+      for: 1m
+      annotations:
+        summary: "Model service has no model loaded"
+    ```
+  </Accordion>
+
+  <Accordion title="images_processed_total — Counter">
+    Cumulative count of images successfully classified since the service started. Incremented once per image, not once per request.
+
+    **No labels.**
+
+    **Example query** — images classified per minute:
+    ```
+    rate(images_processed_total[1m]) * 60
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Prometheus scrape configuration
+
+The monitoring stack scrapes the model service every 15 seconds. The relevant section from `monitoring/prometheus.yml`:
+
+```yaml
+scrape_configs:
+  - job_name: 'model_service'
+    static_configs:
+      - targets: ['model-service:8000']
+    scrape_interval: 15s
+
+  - job_name: 'pushgateway'
+    static_configs:
+      - targets: ['pushgateway:9091']
+    scrape_interval: 15s
+```
+
+<Note>
+  The target `model-service:8000` resolves because Prometheus runs on the same Docker network (`ml-network`) as the model service. If you run Prometheus outside the Docker network, replace `model-service:8000` with `host.docker.internal:8000` or the host machine's IP address.
+</Note>
+
+Prometheus scrapes `/metrics` directly — there is no separate path to configure. The batch orchestrator pushes its own metrics to Pushgateway (`pushgateway:9091`) separately; those metrics appear under the `pushgateway` job, not `model_service`.

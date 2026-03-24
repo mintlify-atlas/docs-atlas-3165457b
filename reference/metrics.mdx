@@ -1,0 +1,264 @@
+---
+title: Metrics reference
+description: All Prometheus metrics exposed by the model service and pushed by the batch orchestrator, with PromQL examples and Grafana dashboard panels.
+---
+
+Autorma exposes metrics through two paths: the model service scrape endpoint (`/metrics`) and the Prometheus Pushgateway (for batch job metrics). Both are collected by Prometheus and visualised in Grafana.
+
+---
+
+## Model service metrics
+
+The model service exposes a Prometheus-compatible `/metrics` endpoint at `http://localhost:8000/metrics`. Prometheus scrapes this endpoint every 15 seconds.
+
+### `api_requests_total`
+
+| Property | Value |
+|---|---|
+| Type | Counter |
+| Labels | `endpoint`, `status` |
+| Description | Total number of API requests received, partitioned by endpoint path and outcome. |
+
+**Label values:**
+- `endpoint`: `/health` or `/predict`
+- `status`: `success` or `error`
+
+**Example PromQL queries:**
+
+```promql
+# Request rate over the last 5 minutes
+rate(api_requests_total[5m])
+
+# Error rate for /predict
+rate(api_requests_total{endpoint="/predict", status="error"}[5m])
+
+# Success ratio
+rate(api_requests_total{status="success"}[5m])
+  / rate(api_requests_total[5m])
+```
+
+---
+
+### `api_request_duration_seconds`
+
+| Property | Value |
+|---|---|
+| Type | Histogram |
+| Labels | `endpoint` |
+| Description | Duration of each API request in seconds, measured from when the handler is entered to when the response is returned. |
+
+**Example PromQL queries:**
+
+```promql
+# 95th percentile latency for /predict
+histogram_quantile(0.95, rate(api_request_duration_seconds_bucket{endpoint="/predict"}[5m]))
+
+# Average latency
+rate(api_request_duration_seconds_sum[5m])
+  / rate(api_request_duration_seconds_count[5m])
+```
+
+---
+
+### `prediction_confidence`
+
+| Property | Value |
+|---|---|
+| Type | Histogram |
+| Buckets | `0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 1.0` |
+| Labels | None |
+| Description | Confidence score of each individual prediction. A value of `1.0` means the model assigned 100% probability to a single class. Buckets are concentrated in the high-confidence range to distinguish well-calibrated predictions from borderline ones. |
+
+**Example PromQL queries:**
+
+```promql
+# Median confidence across all predictions
+histogram_quantile(0.5, rate(prediction_confidence_bucket[5m]))
+
+# Fraction of predictions with confidence above 0.9
+rate(prediction_confidence_bucket{le="1.0"}[5m]) - rate(prediction_confidence_bucket{le="0.9"}[5m])
+```
+
+---
+
+### `predictions_by_class_total`
+
+| Property | Value |
+|---|---|
+| Type | Counter |
+| Labels | `class_name` |
+| Description | Cumulative count of predictions for each output class. Use this to monitor class distribution drift over time. |
+
+**Label values for `class_name`:** `Shirts`, `Watches`, `Casual Shoes`, `Tops`, `Handbags`
+
+**Example PromQL queries:**
+
+```promql
+# Prediction rate per class over the last hour
+rate(predictions_by_class_total[1h])
+
+# Fraction of predictions that are "Shirts"
+rate(predictions_by_class_total{class_name="Shirts"}[5m])
+  / sum(rate(predictions_by_class_total[5m]))
+```
+
+---
+
+### `model_loaded`
+
+| Property | Value |
+|---|---|
+| Type | Gauge |
+| Labels | None |
+| Description | `1` if a model is currently loaded in memory and ready to serve predictions; `0` if the model failed to load or is not yet initialised. |
+
+<Note>
+If `model_loaded` is `0`, the `/predict` endpoint returns HTTP 503. Check the model service logs and verify the `production` alias is set in the MLflow registry.
+</Note>
+
+**Example PromQL queries:**
+
+```promql
+# Alert condition: model not loaded
+model_loaded == 0
+```
+
+---
+
+### `images_processed_total`
+
+| Property | Value |
+|---|---|
+| Type | Counter |
+| Labels | None |
+| Description | Cumulative count of individual images successfully classified since the service started. Incremented once per image inside a `/predict` batch. |
+
+**Example PromQL queries:**
+
+```promql
+# Image processing throughput (images per second)
+rate(images_processed_total[5m])
+
+# Total images processed
+images_processed_total
+```
+
+---
+
+## Batch metrics (Pushgateway)
+
+The batch orchestrator pushes metrics to the Prometheus Pushgateway after each batch run completes. These are emitted as Gauges rather than Counters because the orchestrator is a short-lived process — it pushes a single snapshot of each run's results.
+
+**Job name:** `batch_orchestrator`
+
+All batch metrics are grouped under this job name in Pushgateway. In Prometheus, filter with `{job="batch_orchestrator"}`.
+
+### `batch_duration_seconds`
+
+| Property | Value |
+|---|---|
+| Type | Gauge |
+| Description | Total wall-clock time in seconds for the batch run, from start to when all predictions are written and checkpointed. |
+
+```promql
+batch_duration_seconds{job="batch_orchestrator"}
+```
+
+---
+
+### `batch_images_processed`
+
+| Property | Value |
+|---|---|
+| Type | Gauge |
+| Description | Number of images successfully classified in the most recent batch run. Does not include images that failed. |
+
+```promql
+batch_images_processed{job="batch_orchestrator"}
+```
+
+---
+
+### `batch_images_failed`
+
+| Property | Value |
+|---|---|
+| Type | Gauge |
+| Description | Number of images that could not be classified in the most recent batch run, due to prediction errors or missing files. |
+
+```promql
+batch_images_failed{job="batch_orchestrator"}
+```
+
+---
+
+### `batch_success_rate`
+
+| Property | Value |
+|---|---|
+| Type | Gauge |
+| Description | Fraction of images successfully classified: `successful / total`. Value is between `0.0` and `1.0`. Not set if the batch had zero images. |
+
+```promql
+batch_success_rate{job="batch_orchestrator"}
+
+# Alert if success rate drops below 95%
+batch_success_rate{job="batch_orchestrator"} < 0.95
+```
+
+---
+
+### `predictions_class_<class_name>`
+
+| Property | Value |
+|---|---|
+| Type | Gauge |
+| Labels | None (separate metric per class) |
+| Description | Count of predictions for each class in the most recent batch run. Class names with spaces have spaces replaced by underscores in the metric name (e.g., `predictions_class_Casual_Shoes`). |
+
+**Metric names generated:**
+- `predictions_class_Shirts`
+- `predictions_class_Watches`
+- `predictions_class_Casual_Shoes`
+- `predictions_class_Tops`
+- `predictions_class_Handbags`
+
+```promql
+# View all class counts from the last batch
+{job="batch_orchestrator", __name__=~"predictions_class_.*"}
+```
+
+---
+
+## Prometheus scrape endpoints
+
+| Job | Target | Path | Interval |
+|---|---|---|---|
+| `model_service` | `<host-ip>:8000` | `/metrics` | 15s |
+| `pushgateway` | `pushgateway:9091` | `/metrics` | 15s |
+
+To verify scrape targets are reachable, open Prometheus at `http://localhost:9090/targets`. All configured targets should show state **UP**.
+
+<Warning>
+Prometheus scrapes happen on a 15-second interval. Metrics from a short orchestrator run may only appear in Prometheus after up to 15 seconds. Expand the Grafana time range to at least **Last 15 minutes** to see freshly pushed data.
+</Warning>
+
+---
+
+## Grafana dashboard panels
+
+The Grafana dashboard (accessible at `http://localhost:3000`) provides the following panels:
+
+| Panel | Metric(s) used | Description |
+|---|---|---|
+| **Request rate** | `api_requests_total` | Requests per second to `/predict`, split by status (`success` / `error`). |
+| **Latency (p95)** | `api_request_duration_seconds` | 95th percentile request duration for `/predict`. |
+| **Class distribution** | `predictions_by_class_total`, `predictions_class_*` | Per-class prediction counts, from both live API traffic and batch runs. |
+| **Batch success rate** | `batch_success_rate` | Success rate of the most recently completed batch run. |
+| **Total images processed** | `images_processed_total`, `batch_images_processed` | Cumulative images classified by the model service. |
+| **Batch duration** | `batch_duration_seconds` | How long the most recent batch run took to complete. |
+| **Confidence distribution** | `prediction_confidence` | Histogram of model confidence scores across all predictions. |
+
+<Tip>
+If a panel shows **No data**, run a batch job first to generate traffic, then set the Grafana time range to **Last 6 hours**. Panels backed by Pushgateway metrics will only show data after at least one orchestrator run.
+</Tip>
